@@ -332,7 +332,7 @@ if run:
     with col1:
         st.markdown("### 예측 결과")
         st.metric("발관 실패 확률", f"{pred['probability']*100:.1f}%")
-        st.metric("예측 클래스", pred['class_label"])  # “안전/위험”
+        st.metric("예측 클래스", pred["class_label"])  # “안전/위험”
 
         st.markdown("### 온톨로지 태깅 결과")
         pretty_df = ontology_pretty_table(ontology_json)
