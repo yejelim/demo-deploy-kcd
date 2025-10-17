@@ -1,0 +1,6 @@
+streamlit>=1.38
+openai>=1.45
+pandas>=2.2
+numpy>=1.26
+xgboost>=2.0
+shap>=0.46
