@@ -62,7 +62,55 @@ def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
     df = df[REQUIRED_FEATURES]
     return df
 
-# LLM 태깅 실패시 Fallback
+# -------------------------------
+# 온톨로지 관련 헬퍼
+# -------------------------------
+def _ontology_label_maps():
+    labels = {
+        "hemodynamic_instability": "혈역학적 불안정",
+        "respiratory_distress": "호흡 곤란",
+        "obesity_risk": "비만 위험",
+        "age_risk": "고령 위험",
+        "airway_obstruction_risk": "기도 폐쇄 위험"
+    }
+    desc = {
+        "hemodynamic_instability": "SpO₂<90% 또는 심박 이상",
+        "respiratory_distress": "SpO₂<85%",
+        "obesity_risk": "BMI≥30",
+        "age_risk": "나이≥65세",
+        "airway_obstruction_risk": "비만+호흡곤란 동시"
+    }
+    return labels, desc
+
+def summarize_ontology_for_report(ontology_json: dict):
+    """레포트용: 1(해당)인 온톨로지 항목과 0(비해당) 항목을 구분 정리"""
+    labels, desc = _ontology_label_maps()
+    row = ontology_json["patients"][0]
+    positives, negatives = [], []
+    for k in labels:
+        item = {
+            "key": k,
+            "name": labels[k],
+            "rule": desc[k],
+            "value": int(row.get(k, 0))
+        }
+        (positives if item["value"] == 1 else negatives).append(item)
+    return positives, negatives
+
+def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
+    """온톨로지 결과를 예쁜 테이블(아이콘 포함)로 변환"""
+    labels, desc = _ontology_label_maps()
+    row = ontology_json["patients"][0]
+    rows = []
+    for k in labels:
+        val = int(row.get(k, 0))
+        icon = "✅" if val == 1 else "❌"
+        rows.append({"특성": labels[k], "설명": desc[k], "여부": icon})
+    return pd.DataFrame(rows)
+
+# -------------------------------
+# LLM 태깅 및 룰 기반 Fallback
+# -------------------------------
 def rule_based_ontology(df: pd.DataFrame) -> dict:
     row = df.iloc[0]
     hemo = int((row.get("SPO2", 100) < 90) or (row.get("HR", 80) < 40) or (row.get("HR", 80) > 120))
@@ -110,6 +158,28 @@ def attach_ontology_features(df: pd.DataFrame, ontology_json: dict):
         df[k] = int(v)
     return df
 
+# -------------------------------
+# SHAP 요약 헬퍼
+# -------------------------------
+def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
+    """
+    레포트용: SHAP에서 영향이 큰 상위/하위 요인 리스트를 각각 추립니다.
+    상위: |값| 큰 순, sign>0이면 위험↑, sign<0이면 위험↓
+    """
+    fi = shap_exp.get("feature_importance", {}) or {}
+    if not fi:
+        return [], []
+    triples = [(name, abs(val), val) for name, val in fi.items()]
+    triples.sort(key=lambda x: x[1], reverse=True)
+    top = [{"feature": n, "abs_importance": round(a, 5), "direction": ("위험 증가" if s > 0 else "위험 감소")}
+           for (n, a, s) in triples[:top_k]]
+    bottom = [{"feature": n, "abs_importance": round(a, 5), "direction": ("위험 증가" if s > 0 else "위험 감소")}
+              for (n, a, s) in triples[-top_k:]]
+    return top, bottom
+
+# -------------------------------
+# 예측/SHAP/레포트
+# -------------------------------
 def run_xgb_predict(booster: xgb.Booster, feature_df: pd.DataFrame):
     dmatrix = xgb.DMatrix(feature_df.values)
     preds = booster.predict(dmatrix)
@@ -129,58 +199,63 @@ def compute_shap(booster: xgb.Booster, feature_df: pd.DataFrame):
     top5 = sorted([(k, abs(v)) for k, v in imp_dict.items()], key=lambda x: x[1], reverse=True)[:5]
     return {"shap_values": shap_values, "feature_importance": imp_dict, "top_risk_factors": top5}
 
-def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, shap_exp: dict) -> str:
-    top_risk_factors = []
-    for k, abs_imp in shap_exp["top_risk_factors"]:
-        impact_dir = "위험도 증가" if shap_exp["feature_importance"][k] > 0 else "위험도 감소"
-        top_risk_factors.append({"feature_name": k, "importance_score": round(abs_imp, 4), "impact": impact_dir})
+def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, shap_exp: dict, ontology_json: dict) -> str:
+    """
+    보호자 설명 레포트를 SHAP + 온톨로지 양쪽 근거로 풍부하게 생성.
+    - 예측 클래스(안전/위험)에 따라 톤을 자동 조절
+    - 온톨로지에서 1인 항목은 반드시 본문에 반영
+    - SHAP 상위 요인은 '왜 그런 예측이 나왔는지'를 설명하는 근거로 사용
+    """
+    # 온톨로지 요약(1/0 분리)
+    ont_pos, ont_neg = summarize_ontology_for_report(ontology_json)
+    # SHAP 상·하위 요약
+    shap_top, _ = summarize_shap_for_report(shap_exp, top_k=5)
+
+    # 프롬프트에 넣을 JSON/목록(LLM이 정확히 참고하도록)
+    ont_pos_for_llm = [{"name": x["name"], "rule": x["rule"]} for x in ont_pos] or [{"name": "해당 항목 없음", "rule": ""}]
+    ont_neg_for_llm = [{"name": x["name"], "rule": x["rule"]} for x in ont_neg]
+    shap_top_for_llm = shap_top or [{"feature": "해당 없음", "abs_importance": 0.0, "direction": ""}]
+
+    # 클래스에 따른 톤 가이드
+    cls_label = prediction.get("class_label", "안전")
+    tone_hint = "안심을 드리되 주의점은 명확히 안내" if cls_label == "안전" else "공감적이되 구체적 위험과 모니터링/대응 계획을 명확히 안내"
 
     prompt = f"""
 당신은 의료진과 환자 보호자 사이의 소통을 돕는 의료 커뮤니케이션 전문가입니다.
-아래 인공지능 예측 결과를 바탕으로 보호자가 이해하기 쉬운 설명 레포트를 작성해주세요.
-## 입력 데이터
-### 환자 정보
-{json.dumps(patient_input, indent=2, ensure_ascii=False)}
-### AI 예측 결과
-- 발관(인공호흡기 튜브 제거) 실패 확률: {prediction['probability']:.1%}
-- 예측 클래스: {prediction['class_label']}
-### 주요 위험 요인 (중요도 순위)
-{json.dumps(top_risk_factors, indent=2, ensure_ascii=False)}
-## 레포트 작성 지침
-**목적**: 보호자가 발관(인공호흡기 튜브 제거) 결정을 내리는 데 도움이 되는 정보를 제공합니다.
-**톤 & 스타일**:
-- 따뜻하고 공감적인 어조를 유지하세요
-- 보호자의 불안감을 이해하면서도 정확한 정보를 전달하세요
-- 의학적 전문성과 인간미를 균형있게 표현하세요
-**용어 선택**:
-- 전문 의료 용어는 일반인이 이해하기 쉬운 표현으로 바꿔주세요
-  예: "발관/삽관" → "호흡관 제거", "인공호흡기 튜브 제거"
-  예: "SPO2" → "혈중 산소포화도" 또는 "산소 수치"
-  예: "BMI" → "체질량지수" 또는 "비만도"
-- Feature 이름(영어 또는 전문용어)은 한글로 의역하여 설명하세요
-**설명 방식**:
-- 확률 수치를 구체적인 예시나 비유로 쉽게 설명하세요
-- 위험 요인이 왜 중요한지 보호자 입장에서 설명하세요
-- 의료진의 모니터링과 전문적 판단이 중요함을 강조하세요
-## 레포트 구성 (다음 순서로 작성)
-1. **인사 및 소개** (2-3문장)
-   - 따뜻한 인사와 레포트의 목적 설명
-2. **환자 상태 요약** (3-4문장)
-   - 제공된 환자 정보를 일반인이 이해할 수 있는 방식으로 요약
-   - 각 수치가 정상 범위인지, 주의가 필요한지 간단히 설명
-3. **AI 예측 결과 해석** (4-5문장)
-   - 실패 확률이 의미하는 바를 쉽게 설명
-   - 이 확률이 높은지 낮은지 맥락 제공
-   - 예측이 절대적이 아닌 참고자료임을 명시
-4. **주요 위험 요인 상세 설명** (각 요인당 2-3문장)
-   - 상위 3-5개 위험 요인을 선택하여 설명
-   - 각 요인이 왜 발관 성공/실패에 영향을 미치는지 설명
-   - Feature 이름을 보호자가 이해할 수 있는 용어로 변환
-5. **마무리 메시지** (2문장)
-   - 안심과 격려의 메시지
-   - 의료진의 전문성에 대한 신뢰 강조
-**중요**: 레포트는 순수한 한글 텍스트로만 작성하고, 마크다운 서식(#, **, - 등)은 사용하지 마세요.
-섹션 제목은 [섹션명] 형태로 표시하세요.
+아래 '모델 예측', '온톨로지 판단 결과', 'SHAP 중요 요인'을 모두 참고하여,
+보호자가 이해하기 쉬운 설명 레포트를 작성하세요.
+
+[모델 예측]
+- 발관 실패 확률: {prediction['probability']:.1%}
+- 예측 클래스(안전/위험): {cls_label}
+
+[온톨로지 판단 결과]
+- 이 환자에게 실제 해당된 항목(값=1): {json.dumps(ont_pos_for_llm, ensure_ascii=False)}
+- 해당되지 않은 항목(값=0): {json.dumps(ont_neg_for_llm, ensure_ascii=False)}
+
+[SHAP 중요 요인 Top 5]
+- {json.dumps(shap_top_for_llm, ensure_ascii=False)}
+
+[입력 데이터(요약)]
+- 일부 주요 수치: {json.dumps({k: patient_input[k] for k in ['AGE','BMI','SPO2','MAP','HR','RR','GCS','PH','PACO2','PAO2','HCO3','LACTATE','FIO2','PEEP','PPLAT','TV'] if k in patient_input}, ensure_ascii=False)}
+
+[작성 지침]
+- 톤: {tone_hint}
+- 온톨로지에서 값=1인 항목은 '이 환자에게 실제로 관찰된 위험 신호'로 반드시 본문에 포함하세요.
+- SHAP 상위 요인은 '왜 이런 예측이 나왔는지' 설명하는 근거로 사용하세요. (증가/감소 방향을 자연스럽게 서술)
+- 값=0인 온톨로지 항목은 필요 시 '완화 요인' 또는 '현재는 해당 없음'으로 간단히 언급해도 됩니다.
+- 확률 수치는 비유/사례로 쉽게 설명하되, 절대적인 진단이 아님을 분명히 하세요.
+- 전문용어는 쉬운 말로 풀어서 설명하세요.
+- 마크다운 금지, 섹션 제목은 [섹션명] 형태.
+- 분량: 8~14문장 정도.
+
+[권장 구성]
+1) [인사 및 목적] 2~3문장
+2) [현재 상태 요약] 2~3문장 (중요 수치 간단 해석)
+3) [예측 결과 해석] 2~3문장 (확률 의미, 안전/위험 맥락)
+4) [해당된 위험 신호(온톨로지)] 2~4문장 (값=1 항목을 풀어서 설명)
+5) [예측 근거(모델 관점)] 2~3문장 (SHAP Top 요인들을 사람들이 이해하기 쉬운 언어로)
+6) [권고 및 마무리] 1~2문장 (모니터링/소통 강조)
 """
     resp = client.chat.completions.create(
         model=FIXED_GENERATION_MODEL,
@@ -188,36 +263,13 @@ def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, s
             {"role":"system","content":"당신은 의료 정보를 일반인이 이해하기 쉽게 전달하는 의료 커뮤니케이션 전문가입니다."},
             {"role":"user","content":prompt}
         ],
-        temperature=0.6
+        temperature=0.5
     )
+
     body = resp.choices[0].message.content.strip()
     header = f"{'='*60}\n기계환기 발관 안내문\n{'='*60}\n\n생성 일시: {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')}\n\n"
     footer = f"\n\n{'='*60}\n본 안내문은 AI 기반 예측 시스템을 활용하여 작성되었습니다.\n최종 의료 결정은 담당 의료진의 종합적인 판단에 따라 이루어집니다.\n궁금한 점이나 우려사항이 있으시면 언제든 의료진에게 문의해 주세요.\n{'='*60}\n"
     return header + body + footer
-
-def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
-    """온톨로지 결과를 예쁜 테이블(아이콘 포함)로 변환"""
-    labels = {
-        "hemodynamic_instability": "혈역학적 불안정",
-        "respiratory_distress": "호흡 곤란",
-        "obesity_risk": "비만 위험",
-        "age_risk": "고령 위험",
-        "airway_obstruction_risk": "기도 폐쇄 위험"
-    }
-    desc = {
-        "hemodynamic_instability": "SpO₂<90% 또는 심박 이상",
-        "respiratory_distress": "SpO₂<85%",
-        "obesity_risk": "BMI≥30",
-        "age_risk": "나이≥65세",
-        "airway_obstruction_risk": "비만+호흡곤란 동시"
-    }
-    row = ontology_json["patients"][0]
-    rows = []
-    for k in labels:
-        val = int(row.get(k, 0))
-        icon = "✅" if val == 1 else "❌"
-        rows.append({"특성": labels[k], "설명": desc[k], "여부": icon})
-    return pd.DataFrame(rows)
 
 # -------------------------------
 # 세션 상태 초기화
@@ -350,7 +402,8 @@ if run:
         with st.spinner("설명 레포트 생성 중..."):
             try:
                 client = build_openai_client()
-                report_text = llm_generate_report(client, patient_input, pred, shap_exp)
+                # ⬇️ 온톨로지 함께 전달
+                report_text = llm_generate_report(client, patient_input, pred, shap_exp, ontology_json)
             except Exception as e:
                 st.warning(f"레포트 생성 실패: {e}")
                 report_text = None
@@ -423,15 +476,15 @@ if run:
 # 사이드바: 채팅 (모델/경로 입력 대신)
 # -------------------------------
 with st.sidebar:
-    st.header("💬 대화")
+    st.header("💬 환자 보호자를 위한 챗봇 어시스턴트")
     if OPENAI_API_KEY is None:
         st.caption("OpenAI 키가 없어서 채팅은 비활성화됩니다. (Secrets에 OPENAI_API_KEY 추가)")
     else:
         # 최근 예측 컨텍스트를 시스템 메시지로 주입
         context_blob = json.dumps(st.session_state.memory, ensure_ascii=False, indent=2) if st.session_state.memory else "최근 예측 컨텍스트 없음."
         system_msg = (
-            "당신은 임상의와 협업하는 데이터사이언스 어시스턴트입니다. "
-            "아래 '최근 예측 컨텍스트'를 참고하여 간결하고 정확하게 답변하세요.\n\n"
+            "당신은 중환자실에 입실한 환자 보호자를 대하는 의료인입니다. "
+            "아래 '최근 예측 컨텍스트'를 참고하여 친절하고 쉽게 답변하세요. 의료인이 아닌 사람들도 알아들을 수 있도록 설명하세요. \n\n"
             f"[최근 예측 컨텍스트]\n{context_blob}"
         )
 
