@@ -312,7 +312,7 @@ if "memory" not in st.session_state:
 st.title("Extubation Prediction Demo (Streamlit)")
 
 # (2) 케이스 선택 → 폼 자동 채우기
-st.subheader("1) 예시 케이스 선택")
+st.subheader("➡️ 예시 케이스 선택")
 selected_case = st.selectbox("예시 케이스", list(EXAMPLE_CASES.keys()), index=0)
 case_vals = EXAMPLE_CASES[selected_case]
 
@@ -331,7 +331,7 @@ if st.button("이 케이스 값 불러오기"):
     st.success(f"{selected_case} 값이 입력 폼에 반영되었습니다.")
 
 # 입력 폼
-st.subheader("2) 환자 입력")
+st.subheader("🗒️ 환자 입력")
 colA, colB, colC, colD, colE = st.columns(5)
 
 with colA:
@@ -381,8 +381,8 @@ with colE:
     st.session_state["val_TV"] = st.number_input("TV (mL)", 0.0, 1500.0, float(st.session_state["val_TV"]))
 
 # 실행 버튼
-st.subheader("3) 실행")
-run = st.button("예측 실행")
+st.subheader("➡️ 실행")
+run = st.button("예측 결과 및 레포트 확인하기")
 
 if run:
     # 입력 딕셔너리 만들기
@@ -393,7 +393,7 @@ if run:
     df = _df_from_patient_input(patient_input)
 
     # 2) 온톨로지 태깅
-    with st.spinner("온톨로지 태깅 중..."):
+    with st.spinner("🤖 LLM agent가 예측도 향상을 위한 온톨로지 태깅 중..."):
         try:
             if USE_LLM and OPENAI_API_KEY:
                 client = build_openai_client()
@@ -426,7 +426,7 @@ if run:
     # 5) 레포트
     report_text = None
     if USE_LLM and OPENAI_API_KEY:
-        with st.spinner("설명 레포트 생성 중..."):
+        with st.spinner("🫶 보호자분을 위한 설명 레포트 생성 중..."):
             try:
                 client = build_openai_client()
                 # ⬇️ 온톨로지 함께 전달
