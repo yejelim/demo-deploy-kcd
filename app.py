@@ -12,7 +12,7 @@ from openai import OpenAI
 # -------------------------------
 # 고정 설정(사이드바 입력 제거 버전)
 # -------------------------------
-st.set_page_config(page_title="Extubation Prediction Demo", layout="wide")
+st.set_page_config(page_title="🖥️ KCD 2025 J. - Will the first extubation be successful?", layout="wide")
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
 OPENAI_BASE_URL = st.secrets.get("OPENAI_BASE_URL", None)
