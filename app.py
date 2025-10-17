@@ -350,13 +350,32 @@ if run:
         else:
             st.write("계산되지 않았습니다.")
 
-    # (5) 보호자 레포트: 토글로 온오프
+    # (5) 보호자 설명용 레포트: 편집 가능한 텍스트 박스
     st.markdown("### 보호자 설명용 레포트")
-    show_report = st.toggle("레포트 보기", value=False)
-    if show_report and report_text:
-        st.text(report_text)
-    elif show_report and not report_text:
-        st.info("레포트가 생성되지 않았습니다.")
+
+    if report_text:
+        # 최초 생성 시 세션 상태에 저장
+        if "report_text" not in st.session_state or not st.session_state.get("report_text"):
+            st.session_state.report_text = report_text
+
+        # 편집 가능한 텍스트 영역
+        st.session_state.report_text = st.text_area(
+            "생성된 레포트 (편집 가능)",
+            value=st.session_state.report_text,
+            height=420,
+            help="필요 시 문구를 수정하여 보호자 커뮤니케이션에 활용하세요."
+        )
+
+        # 다운로드 버튼 (선택)
+        st.download_button(
+            label="레포트 .txt 다운로드",
+            data=st.session_state.report_text,
+            file_name=f"extubation_report_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
+    else:
+        st.info("레포트가 생성되지 않았습니다. 상단에서 예측을 실행하면 자동으로 생성됩니다.")
 
     st.markdown("### 모델 입력 전체 Feature (추론 시 사용)")
     st.dataframe(feature_df, use_container_width=True)
