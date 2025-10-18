@@ -596,7 +596,7 @@ with st.sidebar:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-        user_msg = st.chat_input("무엇이든 물어보세요")
+        user_msg = st.chat_input("Ask anything about the patient or the prediction...")
         if user_msg:
             st.session_state.chat_history.append({"role":"user","content":user_msg})
             with st.chat_message("user"):
