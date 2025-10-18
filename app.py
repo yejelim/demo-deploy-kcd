@@ -275,65 +275,45 @@ def run_xgb_predict(model, feature_df: pd.DataFrame):
 
 def compute_shap(model, df_model: pd.DataFrame):
     """
-    SHAP 계산:
-    - 파이프라인: 전처리(transform)를 DataFrame에 적용 후 최종 분류기에 TreeExplainer
-    - 비파이프라인: TreeExplainer(model) + ndarray
-    - 실패 시: KernelExplainer로 폴백 (입력은 항상 DataFrame 컬럼 보존)
+    안정형 SHAP 계산:
+    - 항상 원본 피처(DataFrame) 기준 KernelExplainer 사용
+    - 파이프라인/희소행렬/트리 전용 Explainer 불일치 문제 우회
+    - 단일 케이스 기준으로 빠르게 계산(nsamples 적당히 제한)
     """
-    try:
-        from sklearn.pipeline import Pipeline
+    # 1) 양성 클래스 인덱스 확인
+    pos_idx = 1
+    if hasattr(model, "classes_"):
+        classes = list(model.classes_)
+        if 1 in classes:
+            pos_idx = classes.index(1)
 
-        if isinstance(model, Pipeline):
-            # 전처리(마지막 분류기 제외)
-            preprocess = model[:-1] if len(model.steps) >= 2 else None
-            clf = model.steps[-1][1] if len(model.steps) >= 1 else None
-
-            if preprocess is not None and hasattr(preprocess, "transform") and hasattr(clf, "predict_proba"):
-                # 전처리는 DF로 넣되, 변환 결과는 통상 ndarray
-                X_trans = preprocess.transform(df_model)
-                explainer = shap.TreeExplainer(clf)
-                shap_values = explainer.shap_values(X_trans)
-            else:
-                # 파이프라인 전체로 시도 (일부 환경에서 동작)
-                explainer = shap.TreeExplainer(model)
-                # 일부 버전은 DF도 OK, 안되면 예외에서 폴백 처리
-                shap_values = explainer.shap_values(df_model)
-        else:
-            # 비파이프라인: 모델이 직접 받는 입력으로
-            X_np = df_model.values
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_np)
-
-    except Exception:
-        # 폴백: KernelExplainer — 항상 DataFrame 컬럼을 유지하도록 래핑
+    # 2) 예측 함수(확률 벡터 → class1 확률 1D 벡터)
+    def pred_fn(X):
+        X_df = pd.DataFrame(X, columns=df_model.columns)
         try:
-            def pred_fn(X):
-                # X는 ndarray로 들어오므로 DF로 다시 감싸 컬럼명 유지
-                X_df = pd.DataFrame(X, columns=df_model.columns)
-                try:
-                    return model.predict_proba(X_df)
-                except Exception:
-                    return model.predict_proba(X_df.values)
-
-            bg = df_model.to_numpy()
-            if len(bg) < 10:
-                bg = np.vstack([bg] * 10)
-            explainer = shap.KernelExplainer(pred_fn, bg)
-            shap_values = explainer.shap_values(df_model.to_numpy(), nsamples=50)
+            proba = model.predict_proba(X_df)
         except Exception:
-            return {"shap_values": np.zeros_like(df_model.to_numpy()), "feature_importance": {}, "top_risk_factors": []}
+            proba = model.predict_proba(X_df.values)
+        return proba[:, pos_idx]  # shape: (n_samples,)
 
-    # 이진 분류: class1(위험) 기준
-    if isinstance(shap_values, list) and len(shap_values) == 2:
-        shap_arr = shap_values[1]
-    else:
-        shap_arr = shap_values
+    # 3) 백그라운드(작게): 현재 샘플을 복제해 안정적으로 근사
+    bg = df_model.to_numpy()
+    if len(bg) < 10:
+        bg = np.vstack([bg] * 10)  # 동일 샘플 10개
 
-    # 단일 케이스 기준
-    sample_vals = shap_arr[0]
+    # 4) KernelExplainer로 계산
+    explainer = shap.KernelExplainer(pred_fn, bg)
+    shap_arr = explainer.shap_values(df_model.to_numpy(), nsamples=100)  # (n_samples, n_features)
+
+    # 5) 단일 샘플 SHAP → 중요도 dict/Top5 생성
+    shap_arr = np.asarray(shap_arr)  # 안전 변환
+    sample_vals = shap_arr[0]        # 1D: (n_features,)
     names = df_model.columns.tolist()
-    imp_dict = {names[i]: float(sample_vals[i]) for i in range(len(names))}
+
+    # float 캐스팅에서 에러가 나지 않도록 확실히 스칼라화
+    imp_dict = {names[i]: float(np.asarray(sample_vals[i]).reshape(())) for i in range(len(names))}
     top5 = sorted([(k, abs(v)) for k, v in imp_dict.items()], key=lambda x: x[1], reverse=True)[:5]
+
     return {"shap_values": shap_arr, "feature_importance": imp_dict, "top_risk_factors": top5}
 
 def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
