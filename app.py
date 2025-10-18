@@ -134,7 +134,7 @@ def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
     for k in labels:
         val = int(row.get(k, 0))
         icon = "✅" if val == 1 else "❌"
-        rows.append({"특성": labels[k], "설명": desc[k], "여부": icon})
+        rows.append({"특성": k, "설명": desc[k], "여부": icon})
     return pd.DataFrame(rows)
 
 # -------------------------------
@@ -261,7 +261,7 @@ def run_predict(model, df_model: pd.DataFrame):
             pos_idx = classes.index(1)
 
     p = float(proba[0, pos_idx])
-    y = "위험" if p > 0.5 else "안전"
+    y = "Danger" if p > 0.5 else "Safe"
     return {"probability": p, "class_label": y}
 
 def compute_shap(model, df_model: pd.DataFrame):
@@ -345,12 +345,12 @@ def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, s
         "- 마크다운 금지, 섹션 제목은 [섹션명] 형태.\n"
         "- 분량: 8~14문장 정도.\n\n"
         "[권장 구성]\n"
-        "1) [인사 및 목적] 2~3문장\n"
-        "2) [현재 상태 요약] 2~3문장 (중요 수치 간단 해석)\n"
-        "3) [예측 결과 해석] 2~3문장 (확률 의미, 안전/위험 맥락)\n"
-        "4) [해당된 위험 신호(온톨로지)] 2~4문장 (값=1 항목을 풀어서 설명)\n"
-        "5) [예측 근거(모델 관점)] 2~3문장 (SHAP Top 요인을 쉬운 언어로)\n"
-        "6) [권고 및 마무리] 1~2문장 (모니터링/소통 강조)\n"
+        "1) [greetings and purpose] 2~3문장\n"
+        "2) [current status summary] 2~3문장 (중요 수치 간단 해석)\n"
+        "3) [prediction result interpretation] 2~3문장 (확률 의미, 안전/위험 맥락)\n"
+        "4) [observed risk signals (ontology)] 2~4문장 (값=1 항목을 풀어서 설명)\n"
+        "5) [prediction rationale (model perspective)] 2~3문장 (SHAP Top 요인을 쉬운 언어로)\n"
+        "6) [recommendations and conclusion] 1~2문장 (모니터링/소통 강조)\n"
     )
 
     resp = client.chat.completions.create(
@@ -363,8 +363,8 @@ def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, s
     )
 
     body = resp.choices[0].message.content.strip()
-    header = f"{'='*60}\n기계환기 발관 안내문\n{'='*60}\n\n생성 일시: {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')}\n\n"
-    footer = f"\n\n{'='*60}\n본 안내문은 AI 기반 예측 시스템을 활용하여 작성되었습니다.\n최종 의료 결정은 담당 의료진의 종합적인 판단에 따라 이루어집니다.\n궁금한 점이나 우려사항이 있으시면 언제든 의료진에게 문의해 주세요.\n{'='*60}\n"
+    header = f"{'='*60}\nExtubation Guidance\n{'='*60}\n\n생성 일시: {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')}\n\n"
+    footer = f"\n\n{'='*60}\nThis guidance was generated using an AI-based prediction system.\nFinal medical decisions are made based on the comprehensive judgment of the attending medical staff.\nIf you have any questions or concerns, please feel free to contact the medical staff.\n{'='*60}\n"
     return header + body + footer
 
 # -------------------------------
