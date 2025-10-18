@@ -373,7 +373,7 @@ if "memory" not in st.session_state:
 # -------------------------------
 # 메인 UI
 # -------------------------------
-st.title("Extubation Prediction Demo (Streamlit)")
+st.title("🖥️ KCD 2025 J. - Will the first extubation be successful?")
 
 # (2) 케이스 선택 → 폼 자동 채우기
 st.subheader("➡️ 예시 케이스 선택")
