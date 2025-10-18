@@ -10,22 +10,23 @@ import shap
 from openai import OpenAI
 
 # -------------------------------
-# 고정 설정(사이드바 입력 제거 버전)
+# 페이지/키/모델 경로
 # -------------------------------
 st.set_page_config(page_title="🖥️ KCD 2025 J. - Will the first extubation be successful?", layout="wide")
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
 OPENAI_BASE_URL = st.secrets.get("OPENAI_BASE_URL", None)
 
-# LLM 사용 여부와 모델명/경로를 코드에서 고정
-USE_LLM = True   # secrets에 키가 없으면 자동 Fallback
-FIXED_TAGGING_MODEL = "gpt-4o-mini"        # 사내 게이트웨이 쓰면 거기서 지원하는 이름으로 교체
+USE_LLM = True
+FIXED_TAGGING_MODEL = "gpt-4o-mini"
 FIXED_GENERATION_MODEL = "gpt-4o-mini"
-CHAT_MODEL = "gpt-4o-mini"                 # 사이드바 채팅용
-FIXED_MODEL_PATH = "./models/best_model.pkl"  # RandomForest(파이프라인) pkl
+CHAT_MODEL = "gpt-4o-mini"
+
+# ✅ 온톨로지 포함 학습 모델
+FIXED_MODEL_PATH = "./models/best_model_medgemma.pkl"
 
 # -------------------------------
-# 유틸 / 상수
+# 피처 스키마
 # -------------------------------
 REQUIRED_FEATURES = [
     'AGE', 'SEX', 'BMI', 'VENT_DUR', 'CHF', 'CVD', 'CPD', 'CKD', 'CLD',
@@ -34,13 +35,34 @@ REQUIRED_FEATURES = [
     'POTASSIUM', 'CHLORIDE', 'BUN', 'CR', 'PT', 'FIO2', 'PEEP', 'PPLAT', 'TV'
 ]
 
-# 예시 케이스 1/2/3
+# ✅ 온톨로지 10개 (모델 입력에도 포함됨)
+ONTO_FEATURES = [
+    "diabetes_mellitus",
+    "obesity",
+    "prolonged_mechanical_ventilation_history",
+    "advanced_age",
+    "low_PaO2_FiO2_ratio",
+    "congestive_heart_failure",
+    "anemia",
+    "hemodynamic_instability",
+    "low_mean_arterial_pressure",
+    "leukocytosis",
+]
+
+ALL_FEATURES_FALLBACK = REQUIRED_FEATURES + ONTO_FEATURES
+
+# -------------------------------
+# 예시 케이스
+# -------------------------------
 EXAMPLE_CASES = {
     "케이스 1": {'AGE': 60.0,'SEX': 0.0,'BMI': 31.49090228,'VENT_DUR': 24.88333333,'CHF': 0.0,'CVD': 1.0,'CPD': 0.0,'CKD': 0.0,'CLD': 0.0,'DM': 1.0,'ECMO': 0.0,'CRRT': 0.0,'MAP': 65.0,'HR': 86.0,'RR': 20.0,'BT': 36.5,'SPO2': 95.0,'GCS': 9.0,'PH': 7.41,'PACO2': 40.0,'PAO2': 136.0,'HCO3': 23.0,'LACTATE': 1.8,'WBC': 13.3,'HB': 11.2,'PLT': 166.0,'SODIUM': 138.0,'POTASSIUM': 4.1,'CHLORIDE': 105.0,'BUN': 10.0,'CR': 0.7,'PT': 12.2,'FIO2': 40.0,'PEEP': 5.0,'PPLAT': 21.0,'TV': 546.0},
     "케이스 2": {'AGE': 72.0,'SEX': 1.0,'BMI': 27.3,'VENT_DUR': 72.0,'CHF': 1.0,'CVD': 0.0,'CPD': 1.0,'CKD': 0.0,'CLD': 0.0,'DM': 0.0,'ECMO': 0.0,'CRRT': 0.0,'MAP': 58.0,'HR': 128.0,'RR': 28.0,'BT': 38.4,'SPO2': 88.0,'GCS': 8.0,'PH': 7.32,'PACO2': 50.0,'PAO2': 70.0,'HCO3': 24.0,'LACTATE': 3.2,'WBC': 18.5,'HB': 10.1,'PLT': 140.0,'SODIUM': 136.0,'POTASSIUM': 4.8,'CHLORIDE': 104.0,'BUN': 26.0,'CR': 1.2,'PT': 14.0,'FIO2': 60.0,'PEEP': 8.0,'PPLAT': 28.0,'TV': 420.0},
     "케이스 3": {'AGE': 45.0,'SEX': 1.0,'BMI': 33.8,'VENT_DUR': 12.0,'CHF': 0.0,'CVD': 0.0,'CPD': 0.0,'CKD': 0.0,'CLD': 0.0,'DM': 0.0,'ECMO': 0.0,'CRRT': 0.0,'MAP': 75.0,'HR': 92.0,'RR': 18.0,'BT': 36.8,'SPO2': 97.0,'GCS': 13.0,'PH': 7.43,'PACO2': 37.0,'PAO2': 120.0,'HCO3': 24.0,'LACTATE': 1.2,'WBC': 9.8,'HB': 12.5,'PLT': 210.0,'SODIUM': 140.0,'POTASSIUM': 3.9,'CHLORIDE': 103.0,'BUN': 12.0,'CR': 0.8,'PT': 12.0,'FIO2': 35.0,'PEEP': 5.0,'PPLAT': 19.0,'TV': 500.0}
 }
 
+# -------------------------------
+# 클라이언트/모델 로더
+# -------------------------------
 def build_openai_client():
     if OPENAI_API_KEY is None:
         return None
@@ -49,11 +71,11 @@ def build_openai_client():
     return OpenAI(api_key=OPENAI_API_KEY)
 
 @st.cache_resource(show_spinner=False)
-def load_xgb_model(model_path: str = FIXED_MODEL_PATH):
+def load_model(model_path: str = FIXED_MODEL_PATH):
     p = Path(model_path)
     if not p.exists():
         raise FileNotFoundError(f"Model not found at {model_path}.")
-    model = joblib.load(str(p))  # RandomForest 또는 파이프라인
+    model = joblib.load(str(p))  # RandomForest or Pipeline with ColumnTransformer
     return model
 
 def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
@@ -62,7 +84,7 @@ def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
     return df
 
 # -------------------------------
-# 온톨로지 관련 헬퍼 (10개 확정)
+# 온톨로지 라벨/설명
 # -------------------------------
 def _ontology_label_maps():
     labels = {
@@ -92,7 +114,6 @@ def _ontology_label_maps():
     return labels, desc
 
 def summarize_ontology_for_report(ontology_json: dict):
-    """레포트용: 1(해당)인 온톨로지 항목과 0(비해당) 항목을 구분 정리"""
     labels, desc = _ontology_label_maps()
     row = ontology_json["patients"][0]
     positives, negatives = [], []
@@ -107,24 +128,23 @@ def summarize_ontology_for_report(ontology_json: dict):
     return positives, negatives
 
 def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
-    """온톨로지 결과를 예쁜 테이블(아이콘 포함)로 변환"""
     labels, desc = _ontology_label_maps()
     row = ontology_json["patients"][0]
     rows = []
     for k in labels:
         val = int(row.get(k, 0))
         icon = "✅" if val == 1 else "❌"
-        rows.append({"특성": labels[k], "여부": icon})
+        rows.append({"특성": labels[k], "설명": desc[k], "여부": icon})
     return pd.DataFrame(rows)
 
 # -------------------------------
-# LLM 태깅 및 룰 기반 Fallback
+# 온톨로지 태깅 (LLM/룰)
 # -------------------------------
 def rule_based_ontology(df: pd.DataFrame) -> dict:
     row = df.iloc[0]
     dm = int(row.get("DM", 0) == 1)
     obesity = int(float(row.get("BMI", 0)) >= 30)
-    prolonged_mv = int(float(row.get("VENT_DUR", 0)) >= 48)  # hours
+    prolonged_mv = int(float(row.get("VENT_DUR", 0)) >= 48)
     advanced_age = int(float(row.get("AGE", 0)) >= 65)
 
     pao2 = float(row.get("PAO2", 0))
@@ -159,8 +179,6 @@ def rule_based_ontology(df: pd.DataFrame) -> dict:
 
 def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
     patient_records = df.to_dict(orient='records')
-
-    # JSON 스키마를 dict로 만들고 dumps로 주입 (f-string 중괄호 에러 방지)
     schema = {
         "patients": [{
             "patient_index": 0,
@@ -176,7 +194,6 @@ def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
             "leukocytosis": 0
         }]
     }
-
     prompt = (
         "당신은 의료 전문가입니다. 다음 환자 데이터를 분석하여 발관(extubation) 시 위험 요인이 될 수 있는 "
         "온톨로지 특성을 태깅해주세요.\n\n"
@@ -188,7 +205,6 @@ def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
         "반드시 아래 JSON 스키마만 반환:\n"
         f"{json.dumps(schema, ensure_ascii=False, indent=2)}"
     )
-
     resp = client.chat.completions.create(
         model=FIXED_TAGGING_MODEL,
         messages=[
@@ -201,44 +217,23 @@ def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
     return json.loads(resp.choices[0].message.content)
 
 def attach_ontology_features(df: pd.DataFrame, ontology_json: dict):
-    # ❗ 모델 입력에는 사용하지 않고, UI 표시/레포트용으로만 사용
-    feature_names = [
-        "diabetes_mellitus",
-        "obesity",
-        "prolonged_mechanical_ventilation_history",
-        "advanced_age",
-        "low_PaO2_FiO2_ratio",
-        "congestive_heart_failure",
-        "anemia",
-        "hemodynamic_instability",
-        "low_mean_arterial_pressure",
-        "leukocytosis",
-    ]
-    for k in feature_names:
-        v = ontology_json["patients"][0].get(k, 0)
-        df[k] = int(v)
+    row = ontology_json["patients"][0]
+    for k in ONTO_FEATURES:
+        df[k] = int(row.get(k, 0))
     return df
 
 # -------------------------------
 # 모델 기대 피처 자동 추론
 # -------------------------------
 def get_expected_model_features(model, fallback_cols):
-    """
-    모델/파이프라인로부터 기대 입력 피처명을 최대한 추론.
-    - feature_names_in_가 있으면 사용
-    - 파이프라인인 경우, ColumnTransformer의 feature_names_in_ 시도
-    - 실패 시 fallback_cols 반환
-    """
-    # 1) 모델 자체에 feature_names_in_
+    # 1) feature_names_in_
     if hasattr(model, "feature_names_in_"):
         return list(model.feature_names_in_)
-
-    # 2) 파이프라인 내부 탐색
+    # 2) 파이프라인 내부 추론
     try:
         from sklearn.pipeline import Pipeline
         from sklearn.compose import ColumnTransformer
         if isinstance(model, Pipeline):
-            # 전처리기 또는 중간 스텝에서 feature_names_in_ 찾기
             for name, step in model.steps:
                 if hasattr(step, "feature_names_in_"):
                     return list(step.feature_names_in_)
@@ -246,76 +241,69 @@ def get_expected_model_features(model, fallback_cols):
                     return list(step.feature_names_in_)
     except Exception:
         pass
-
-    # 3) 실패 시 폴백
+    # 3) 실패 시 폴백(원본+온톨로지)
     return list(fallback_cols)
 
 # -------------------------------
-# 예측/SHAP/레포트
+# 예측 / SHAP
 # -------------------------------
-def run_xgb_predict(model, feature_df: pd.DataFrame):
-    """
-    RandomForest 또는 파이프라인 가정.
-    파이프라인이면 내부에서 transform 후 predict_proba 수행됨.
-    """
+def run_predict(model, df_model: pd.DataFrame):
+    # DataFrame 우선
     try:
         proba = model.predict_proba(df_model)
     except Exception:
-        proba = model.predict_proba(feature_df.values)
+        proba = model.predict_proba(df_model.values)
 
-    # 클래스 인덱스 확인 (보통 array([0,1]))
     pos_idx = 1
     if hasattr(model, "classes_"):
         classes = list(model.classes_)
         if 1 in classes:
             pos_idx = classes.index(1)
+
     p = float(proba[0, pos_idx])
     y = "위험" if p > 0.5 else "안전"
     return {"probability": p, "class_label": y}
 
 def compute_shap(model, df_model: pd.DataFrame):
     """
-    안정형 SHAP 계산:
-    - 항상 원본 피처(DataFrame) 기준 KernelExplainer 사용
-    - 파이프라인/희소행렬/트리 전용 Explainer 불일치 문제 우회
-    - 단일 케이스 기준으로 빠르게 계산(nsamples 적당히 제한)
+    안정형 SHAP: KernelExplainer로 class1 확률에 대한 기여도를 계산.
+    파이프라인/희소행렬/트리해석기 불일치 문제를 회피.
     """
-    # 1) 양성 클래스 인덱스 확인
+    # class1 인덱스
     pos_idx = 1
     if hasattr(model, "classes_"):
         classes = list(model.classes_)
         if 1 in classes:
             pos_idx = classes.index(1)
 
-    # 2) 예측 함수(확률 벡터 → class1 확률 1D 벡터)
+    # 예측 함수: class1 확률 반환
     def pred_fn(X):
         X_df = pd.DataFrame(X, columns=df_model.columns)
         try:
             proba = model.predict_proba(X_df)
         except Exception:
             proba = model.predict_proba(X_df.values)
-        return proba[:, pos_idx]  # shape: (n_samples,)
+        return proba[:, pos_idx]
 
-    # 3) 백그라운드(작게): 현재 샘플을 복제해 안정적으로 근사
+    # 백그라운드: 동일 샘플 복제(속도/안정 균형)
     bg = df_model.to_numpy()
     if len(bg) < 10:
-        bg = np.vstack([bg] * 10)  # 동일 샘플 10개
+        bg = np.vstack([bg] * 10)
 
-    # 4) KernelExplainer로 계산
     explainer = shap.KernelExplainer(pred_fn, bg)
-    shap_arr = explainer.shap_values(df_model.to_numpy(), nsamples=100)  # (n_samples, n_features)
+    shap_arr = explainer.shap_values(df_model.to_numpy(), nsamples=100)
+    shap_arr = np.asarray(shap_arr)
+    sample_vals = shap_arr[0]  # 1D (n_features,)
 
-    # 5) 단일 샘플 SHAP → 중요도 dict/Top5 생성
-    shap_arr = np.asarray(shap_arr)  # 안전 변환
-    sample_vals = shap_arr[0]        # 1D: (n_features,)
     names = df_model.columns.tolist()
-
-    # float 캐스팅에서 에러가 나지 않도록 확실히 스칼라화
     imp_dict = {names[i]: float(np.asarray(sample_vals[i]).reshape(())) for i in range(len(names))}
     top5 = sorted([(k, abs(v)) for k, v in imp_dict.items()], key=lambda x: x[1], reverse=True)[:5]
 
     return {"shap_values": shap_arr, "feature_importance": imp_dict, "top_risk_factors": top5}
 
+# -------------------------------
+# 레포트 생성
+# -------------------------------
 def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
     fi = shap_exp.get("feature_importance", {}) or {}
     if not fi:
@@ -329,11 +317,6 @@ def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
     return top, bottom
 
 def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, shap_exp: dict, ontology_json: dict) -> str:
-    """
-    보호자 설명 레포트를 SHAP + 온톨로지 양쪽 근거로 풍부하게 생성.
-    - 온톨로지에서 1인 항목은 반드시 본문에 반영
-    - SHAP 상위 요인은 '왜 이런 예측이 나왔는지' 근거로 사용
-    """
     ont_pos, ont_neg = summarize_ontology_for_report(ontology_json)
     shap_top, _ = summarize_shap_for_report(shap_exp, top_k=5)
 
@@ -353,6 +336,7 @@ def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, s
         f"[입력 데이터(요약)]\n- 일부 주요 수치: "
         f"{json.dumps({k: patient_input[k] for k in ['AGE','BMI','SPO2','MAP','HR','RR','GCS','PH','PACO2','PAO2','HCO3','LACTATE','FIO2','PEEP','PPLAT','TV'] if k in patient_input}, ensure_ascii=False)}\n\n"
         "[작성 지침]\n"
+        "- 톤&스타일: 따뜻하고 공감적인 어조를 유지하세요. 보호자의 불안감을 이해하면서도 정확한 정보를 전달하세요. 의학적 전문성과 인간미를 균형 있게 표현하세요."
         "- 온톨로지에서 값=1인 항목은 '이 환자에게 실제로 관찰된 위험 신호'로 반드시 본문에 포함하세요.\n"
         "- SHAP 상위 요인은 '왜 이런 예측이 나왔는지' 설명하는 근거로 사용하세요. (증가/감소 방향을 자연스럽게 서술)\n"
         "- 값=0인 온톨로지 항목은 필요 시 '완화 요인' 또는 '현재는 해당 없음'으로 간단히 언급해도 됩니다.\n"
@@ -384,29 +368,27 @@ def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, s
     return header + body + footer
 
 # -------------------------------
-# 세션 상태 초기화
+# 세션 상태
 # -------------------------------
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # [{role, content}]
+    st.session_state.chat_history = []
 if "memory" not in st.session_state:
-    st.session_state.memory = {}        # 최근 예측 컨텍스트 저장
+    st.session_state.memory = {}
 
 # -------------------------------
-# 메인 UI
+# UI
 # -------------------------------
 st.title("🖥️ KCD 2025 J. - Will the first extubation be successful?")
 
-# (2) 케이스 선택 → 폼 자동 채우기
 st.subheader("➡️ 예시 케이스 선택")
 selected_case = st.selectbox("예시 케이스", list(EXAMPLE_CASES.keys()), index=0)
 case_vals = EXAMPLE_CASES[selected_case]
 
-# 폼 입력값을 세션에 반영
+# 초기값 주입
 for k in REQUIRED_FEATURES:
     if f"val_{k}" not in st.session_state:
         st.session_state[f"val_{k}"] = case_vals.get(k, np.nan)
 
-# 케이스 선택이 바뀌면 해당 값으로 초기화
 def apply_case(vals: dict):
     for k, v in vals.items():
         st.session_state[f"val_{k}"] = v
@@ -415,7 +397,6 @@ if st.button("이 케이스 값 불러오기"):
     apply_case(EXAMPLE_CASES[selected_case])
     st.success(f"{selected_case} 값이 입력 폼에 반영되었습니다.")
 
-# 입력 폼
 st.subheader("🗒️ 환자 입력")
 colA, colB, colC, colD, colE = st.columns(5)
 
@@ -465,20 +446,17 @@ with colE:
     st.session_state["val_PPLAT"] = st.number_input("Pplat", 0.0, 60.0, float(st.session_state["val_PPLAT"]))
     st.session_state["val_TV"] = st.number_input("TV (mL)", 0.0, 1500.0, float(st.session_state["val_TV"]))
 
-# 실행 버튼
 st.subheader("➡️ 실행")
 run = st.button("예측 결과 및 레포트 확인하기")
 
 if run:
-    # 입력 딕셔너리 만들기
+    # 1) 입력 DF(베이스라인)
     patient_input = {k: float(st.session_state[f"val_{k}"]) if not np.isnan(st.session_state[f"val_{k}"]) else np.nan
                      for k in REQUIRED_FEATURES}
-
-    # 1) 입력 → DF (베이스라인)
     df_base = _df_from_patient_input(patient_input)
 
-    # 2) 온톨로지 태깅 (UI/레포트용)
-    with st.spinner("🤖 LLM agent가 예측도 향상을 위한 온톨로지 태깅 중..."):
+    # 2) 온톨로지 태깅 → 모델/UI 둘 다 사용
+    with st.spinner("🤖 LLM agent가 온톨로지 태깅 중..."):
         try:
             if USE_LLM and OPENAI_API_KEY:
                 client = build_openai_client()
@@ -489,21 +467,21 @@ if run:
             st.warning(f"LLM 태깅 실패. 룰 기반으로 대체합니다. ({e})")
             ontology_json = rule_based_ontology(df_base)
 
-    # ✅ UI용(표시/레포트): 온톨로지 추가
-    df_ui = attach_ontology_features(df_base.copy(), ontology_json)
+    # ✅ 모델 입력/표시 모두 온톨로지 포함
+    df_with_onto = attach_ontology_features(df_base.copy(), ontology_json)
 
-    # 3) 모델 로드 & 예측 (❗ 모델 입력에는 온톨로지 미포함)
-    with st.spinner("랜덤포레스트로 예측 중..."):
+    # 3) 모델 로드 & 예측 (온톨로지 포함 입력)
+    with st.spinner("랜덤포레스트(온톨로지 포함)로 예측 중..."):
         try:
-            model = load_xgb_model(FIXED_MODEL_PATH)
-            expected_cols = get_expected_model_features(model, fallback_cols=REQUIRED_FEATURES)
-            df_model = df_base.reindex(columns=expected_cols)
-            pred = run_xgb_predict(model, df_model)
+            model = load_model(FIXED_MODEL_PATH)
+            expected_cols = get_expected_model_features(model, fallback_cols=ALL_FEATURES_FALLBACK)
+            df_model = df_with_onto.reindex(columns=expected_cols)
+            pred = run_predict(model, df_model)
         except Exception as e:
             st.error(f"예측 오류: {e}")
             st.stop()
 
-    # 4) SHAP (✅ 모델 입력 df_model 기준)
+    # 4) SHAP (온톨로지 포함 입력 기준)
     with st.spinner("SHAP 계산 중..."):
         try:
             shap_exp = compute_shap(model, df_model)
@@ -529,7 +507,7 @@ if run:
     with col1:
         st.markdown("### 예측 결과")
         st.metric("발관 실패 확률", f"{pred['probability']*100:.1f}%")
-        st.metric("예측 클래스", pred["class_label"])  # “안전/위험”
+        st.metric("예측 클래스", pred["class_label"])
 
         st.markdown("### 온톨로지 태깅 결과")
         pretty_df = ontology_pretty_table(ontology_json)
@@ -547,7 +525,7 @@ if run:
         else:
             st.write("계산되지 않았습니다.")
 
-    # (5) 보호자 설명용 레포트: 편집 가능한 텍스트 박스
+    # 보호자 설명용 레포트 (편집/다운로드)
     st.markdown("### 보호자 설명용 레포트")
     if report_text:
         if "report_text" not in st.session_state or not st.session_state.get("report_text"):
@@ -568,10 +546,26 @@ if run:
     else:
         st.info("레포트가 생성되지 않았습니다. 상단에서 예측을 실행하면 자동으로 생성됩니다.")
 
-    st.markdown("### 모델 입력 전체 Feature (추론 시 사용)")
-    st.dataframe(df_model, use_container_width=True)
+    # ▶ 모델 입력 전체 Feature (온톨로지 포함)
+    st.markdown("### 모델 입력 전체 Feature (온톨로지 포함, 추론 시 사용)")
+    # 보기 좋게: 모델 입력 피처 + 온톨로지 라벨/설명 합쳐서 보여주기
+    labels, desc = _ontology_label_maps()
+    onto_row = ontology_json["patients"][0]
+    df_display = df_model.T.rename(columns={0: "Value"})
+    sep = pd.DataFrame([[""]], index=[" "], columns=["Value"])
+    onto_rows = []
+    for key in ONTO_FEATURES:
+        onto_rows.append({
+            "Feature": key,
+            "태깅결과(0/1)": int(onto_row.get(key, 0)),
+            "온톨로지_특성": labels.get(key, key),
+            "의미(설명)": desc.get(key, "")
+        })
+    onto_df = pd.DataFrame(onto_rows).set_index("Feature")
+    df_display = pd.concat([df_display, sep, onto_df], axis=0)
+    st.dataframe(df_display, use_container_width=True, height=600)
 
-    # 채팅 메모리에 저장할 컨텍스트 업데이트
+    # 채팅 컨텍스트 메모리
     st.session_state.memory = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "selected_case": selected_case,
@@ -581,7 +575,7 @@ if run:
     }
 
 # -------------------------------
-# 사이드바: 채팅 (모델/경로 입력 대신)
+# 사이드바: 챗봇
 # -------------------------------
 with st.sidebar:
     st.header("💬 환자 보호자를 위한 챗봇 어시스턴트")
@@ -594,7 +588,6 @@ with st.sidebar:
             "아래 '최근 예측 컨텍스트'를 참고하여 친절하고 쉽게 답변하세요. 의료인이 아닌 사람들도 알아들을 수 있도록 설명하세요. \n\n"
             f"[최근 예측 컨텍스트]\n{context_blob}"
         )
-
         for m in st.session_state.chat_history:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
@@ -604,7 +597,6 @@ with st.sidebar:
             st.session_state.chat_history.append({"role":"user","content":user_msg})
             with st.chat_message("user"):
                 st.markdown(user_msg)
-
             try:
                 client = build_openai_client()
                 messages = [{"role":"system","content":system_msg}] + st.session_state.chat_history[-20:]
@@ -616,7 +608,6 @@ with st.sidebar:
                 bot_text = resp.choices[0].message.content.strip()
             except Exception as e:
                 bot_text = f"(오류) {e}"
-
             st.session_state.chat_history.append({"role":"assistant","content":bot_text})
             with st.chat_message("assistant"):
                 st.markdown(bot_text)
