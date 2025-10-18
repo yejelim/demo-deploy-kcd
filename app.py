@@ -258,7 +258,11 @@ def run_xgb_predict(model, feature_df: pd.DataFrame):
     RandomForest 또는 파이프라인 가정.
     파이프라인이면 내부에서 transform 후 predict_proba 수행됨.
     """
-    proba = model.predict_proba(feature_df.values)
+    try:
+        proba = model.predict_proba(df_model)
+    except Exception:
+        proba = model.predict_proba(feature_df.values)
+
     # 클래스 인덱스 확인 (보통 array([0,1]))
     pos_idx = 1
     if hasattr(model, "classes_"):
@@ -272,56 +276,60 @@ def run_xgb_predict(model, feature_df: pd.DataFrame):
 def compute_shap(model, df_model: pd.DataFrame):
     """
     SHAP 계산:
-    - 파이프라인이면 전처리(transform) 후 최종 분류기에 TreeExplainer 적용
-    - 그 외엔 모델에 TreeExplainer 시도
-    - 실패 시 KernelExplainer로 폴백 (단일 샘플 OK)
+    - 파이프라인: 전처리(transform)를 DataFrame에 적용 후 최종 분류기에 TreeExplainer
+    - 비파이프라인: TreeExplainer(model) + ndarray
+    - 실패 시: KernelExplainer로 폴백 (입력은 항상 DataFrame 컬럼 보존)
     """
-    X = df_model.values
-
-    # 파이프라인 핸들링
     try:
         from sklearn.pipeline import Pipeline
-        from sklearn.compose import ColumnTransformer
 
         if isinstance(model, Pipeline):
-            # 전처리와 분류기 추출
-            preprocess = None
-            clf = None
-            # 일반적으로 마지막 스텝이 분류기
-            if hasattr(model, "steps") and len(model.steps) >= 1:
-                preprocess = None
-                if len(model.steps) >= 2:
-                    # 마지막 이전까지를 전처리 파이프라인으로 보고 transform 적용
-                    preprocess = model[:-1]
-                clf = model.steps[-1][1]
+            # 전처리(마지막 분류기 제외)
+            preprocess = model[:-1] if len(model.steps) >= 2 else None
+            clf = model.steps[-1][1] if len(model.steps) >= 1 else None
 
             if preprocess is not None and hasattr(preprocess, "transform") and hasattr(clf, "predict_proba"):
+                # 전처리는 DF로 넣되, 변환 결과는 통상 ndarray
                 X_trans = preprocess.transform(df_model)
                 explainer = shap.TreeExplainer(clf)
                 shap_values = explainer.shap_values(X_trans)
             else:
-                # 전처리를 분리할 수 없으면 파이프라인 전체에 대해 바로 시도
+                # 파이프라인 전체로 시도 (일부 환경에서 동작)
                 explainer = shap.TreeExplainer(model)
-                shap_values = explainer.shap_values(X)
+                # 일부 버전은 DF도 OK, 안되면 예외에서 폴백 처리
+                shap_values = explainer.shap_values(df_model)
         else:
-            # 파이프라인이 아니면 바로 TreeExplainer
+            # 비파이프라인: 모델이 직접 받는 입력으로
+            X_np = df_model.values
             explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X)
-    except Exception:
-        # 폴백: KernelExplainer (시간은 더 들지만 단일 샘플은 가능)
-        try:
-            background = X if len(X) > 10 else np.vstack([X]*10)
-            explainer = shap.KernelExplainer(model.predict_proba, background)
-            shap_values = explainer.shap_values(X, nsamples=50)
-        except Exception:
-            return {"shap_values": np.zeros_like(X), "feature_importance": {}, "top_risk_factors": []}
+            shap_values = explainer.shap_values(X_np)
 
-    # 이진 분류: class1(위험) 기준으로 선택
+    except Exception:
+        # 폴백: KernelExplainer — 항상 DataFrame 컬럼을 유지하도록 래핑
+        try:
+            def pred_fn(X):
+                # X는 ndarray로 들어오므로 DF로 다시 감싸 컬럼명 유지
+                X_df = pd.DataFrame(X, columns=df_model.columns)
+                try:
+                    return model.predict_proba(X_df)
+                except Exception:
+                    return model.predict_proba(X_df.values)
+
+            bg = df_model.to_numpy()
+            if len(bg) < 10:
+                bg = np.vstack([bg] * 10)
+            explainer = shap.KernelExplainer(pred_fn, bg)
+            shap_values = explainer.shap_values(df_model.to_numpy(), nsamples=50)
+        except Exception:
+            return {"shap_values": np.zeros_like(df_model.to_numpy()), "feature_importance": {}, "top_risk_factors": []}
+
+    # 이진 분류: class1(위험) 기준
     if isinstance(shap_values, list) and len(shap_values) == 2:
         shap_arr = shap_values[1]
     else:
         shap_arr = shap_values
 
+    # 단일 케이스 기준
     sample_vals = shap_arr[0]
     names = df_model.columns.tolist()
     imp_dict = {names[i]: float(sample_vals[i]) for i in range(len(names))}
