@@ -578,10 +578,10 @@ if run:
 # -------------------------------
 with st.sidebar:
     from pathlib import Path
-    image_path = Path("image_kcd.jpeg")
+    image_path = Path("image_kcd.jpg")
     if image_path.exists():
         st.image(str(image_path), use_container_width=True)
-        
+
     st.header("💬 환자 보호자를 위한 챗봇 어시스턴트")
     if OPENAI_API_KEY is None:
         st.caption("OpenAI 키가 없어서 채팅은 비활성화됩니다. (Secrets에 OPENAI_API_KEY 추가)")
