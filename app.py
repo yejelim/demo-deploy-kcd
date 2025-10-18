@@ -22,7 +22,7 @@ USE_LLM = True   # secrets에 키가 없으면 자동 Fallback
 FIXED_TAGGING_MODEL = "gpt-4o-mini"        # 사내 게이트웨이 쓰면 거기서 지원하는 이름으로 교체
 FIXED_GENERATION_MODEL = "gpt-4o-mini"
 CHAT_MODEL = "gpt-4o-mini"                 # 사이드바 채팅용
-FIXED_MODEL_PATH = "./models/best_model.pkl"
+FIXED_MODEL_PATH = "./models/best_model.pkl"  # RandomForest(파이프라인) pkl
 
 # -------------------------------
 # 유틸 / 상수
@@ -53,7 +53,7 @@ def load_xgb_model(model_path: str = FIXED_MODEL_PATH):
     p = Path(model_path)
     if not p.exists():
         raise FileNotFoundError(f"Model not found at {model_path}.")
-    model = joblib.load(str(p))
+    model = joblib.load(str(p))  # RandomForest 또는 파이프라인
     return model
 
 def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
@@ -62,7 +62,7 @@ def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
     return df
 
 # -------------------------------
-# 온톨로지 관련 헬퍼
+# 온톨로지 관련 헬퍼 (10개 확정)
 # -------------------------------
 def _ontology_label_maps():
     labels = {
@@ -78,16 +78,16 @@ def _ontology_label_maps():
         "leukocytosis": "백혈구 증가증",
     }
     desc = {
-        "diabetes_mellitus": "SpO₂<90% 또는 심박 이상",
-        "obesity": "SpO₂<85%",
-        "prolonged_mechanical_ventilation_history": "장기간 기계환기 병력",
-        "advanced_age": "고령",
-        "low_PaO2_FiO2_ratio": "낮은 PaO2/FiO2 비율",
-        "congestive_heart_failure": "울혈성 심부전",
-        "anemia": "빈혈",
-        "hemodynamic_instability": "혈압 또는 심박 이상",
-        "low_mean_arterial_pressure": "낮은 평균 동맥압",
-        "leukocytosis": "백혈구 증가증"
+        "diabetes_mellitus": "당뇨병 병력 또는 혈당 조절 문제",
+        "obesity": "BMI≥30",
+        "prolonged_mechanical_ventilation_history": "기계환기 48시간 이상",
+        "advanced_age": "나이≥65세",
+        "low_PaO2_FiO2_ratio": "PaO2/FiO2<200",
+        "congestive_heart_failure": "울혈성 심부전 병력",
+        "anemia": "Hb<10 g/dL",
+        "hemodynamic_instability": "HR<40/HR>120 또는 MAP<60",
+        "low_mean_arterial_pressure": "MAP<65",
+        "leukocytosis": "WBC>12 (×10^3/μL)",
     }
     return labels, desc
 
@@ -122,18 +122,17 @@ def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
 # -------------------------------
 def rule_based_ontology(df: pd.DataFrame) -> dict:
     row = df.iloc[0]
-    # Updated ontology mapping (align with keys defined at the top helpers)
-    dm = int(row.get("DM", 0) == 1)  # explicit diabetes flag
-    obesity = int(row.get("BMI", 0) >= 30)
-    prolonged_mv = int(row.get("VENT_DUR", 0) >= 48)  # hours threshold for prolonged ventilation
-    advanced_age = int(row.get("AGE", 0) >= 65)
-    # PaO2/FiO2 ratio (FiO2 given as %, ensure minimum 21%)
+    dm = int(row.get("DM", 0) == 1)
+    obesity = int(float(row.get("BMI", 0)) >= 30)
+    prolonged_mv = int(float(row.get("VENT_DUR", 0)) >= 48)  # hours
+    advanced_age = int(float(row.get("AGE", 0)) >= 65)
+
     pao2 = float(row.get("PAO2", 0))
     fio2_pct = float(row.get("FIO2", 21.0))
     fio2_frac = max(fio2_pct, 21.0) / 100.0
     pf_ratio = pao2 / fio2_frac if fio2_frac > 0 else 0.0
-    low_pfr = int(pf_ratio < 200)  # conservative threshold
-    # New signals
+    low_pfr = int(pf_ratio < 200)
+
     chf = int(row.get("CHF", 0) == 1)
     anemia = int(float(row.get("HB", 0)) < 10.0)
     hemo_instab = int((float(row.get("HR", 80)) < 40) or (float(row.get("HR", 80)) > 120) or (float(row.get("MAP", 80)) < 60))
@@ -160,41 +159,36 @@ def rule_based_ontology(df: pd.DataFrame) -> dict:
 
 def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
     patient_records = df.to_dict(orient='records')
-    prompt = f"""
-당신은 의료 전문가입니다. 다음 환자 데이터를 분석하여 발관(extubation) 시 위험 요인이 될 수 있는 온톨로지 특성을 태깅해주세요.
 
-환자 데이터:
-{json.dumps(patient_records, ensure_ascii=False, indent=2)}
+    # JSON 스키마를 dict로 만들고 dumps로 주입 (f-string 중괄호 에러 방지)
+    schema = {
+        "patients": [{
+            "patient_index": 0,
+            "diabetes_mellitus": 0,
+            "obesity": 0,
+            "prolonged_mechanical_ventilation_history": 0,
+            "advanced_age": 0,
+            "low_PaO2_FiO2_ratio": 0,
+            "congestive_heart_failure": 0,
+            "anemia": 0,
+            "hemodynamic_instability": 0,
+            "low_mean_arterial_pressure": 0,
+            "leukocytosis": 0
+        }]
+    }
 
-다음 특성을 0 또는 1로 반환:
-1. diabetes_mellitus
-2. obesity
-3. prolonged_mechanical_ventilation_history
-4. advanced_age
-5. low_PaO2_FiO2_ratio
-6. congestive_heart_failure
-7. anemia
-8. hemodynamic_instability
-9. low_mean_arterial_pressure
-10. leukocytosis
+    prompt = (
+        "당신은 의료 전문가입니다. 다음 환자 데이터를 분석하여 발관(extubation) 시 위험 요인이 될 수 있는 "
+        "온톨로지 특성을 태깅해주세요.\n\n"
+        f"환자 데이터:\n{json.dumps(patient_records, ensure_ascii=False, indent=2)}\n\n"
+        "다음 특성을 0 또는 1로 반환:\n"
+        "1. diabetes_mellitus\n2. obesity\n3. prolonged_mechanical_ventilation_history\n"
+        "4. advanced_age\n5. low_PaO2_FiO2_ratio\n6. congestive_heart_failure\n7. anemia\n"
+        "8. hemodynamic_instability\n9. low_mean_arterial_pressure\n10. leukocytosis\n\n"
+        "반드시 아래 JSON 스키마만 반환:\n"
+        f"{json.dumps(schema, ensure_ascii=False, indent=2)}"
+    )
 
-반드시 아래 JSON 스키마만 반환:
-{
-    "patients": [{
-        "patient_index":0,
-        "diabetes_mellitus":0,
-        "obesity":0,
-        "prolonged_mechanical_ventilation_history":0,
-        "advanced_age":0,
-        "low_PaO2_FiO2_ratio":0,
-        "congestive_heart_failure":0,
-        "anemia":0,
-        "hemodynamic_instability":0,
-        "low_mean_arterial_pressure":0,
-        "leukocytosis":0
-    }]
-}
-"""
     resp = client.chat.completions.create(
         model=FIXED_TAGGING_MODEL,
         messages=[
@@ -207,6 +201,7 @@ def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
     return json.loads(resp.choices[0].message.content)
 
 def attach_ontology_features(df: pd.DataFrame, ontology_json: dict):
+    # ❗ 모델 입력에는 사용하지 않고, UI 표시/레포트용으로만 사용
     feature_names = [
         "diabetes_mellitus",
         "obesity",
@@ -225,13 +220,115 @@ def attach_ontology_features(df: pd.DataFrame, ontology_json: dict):
     return df
 
 # -------------------------------
-# SHAP 요약 헬퍼
+# 모델 기대 피처 자동 추론
 # -------------------------------
+def get_expected_model_features(model, fallback_cols):
+    """
+    모델/파이프라인로부터 기대 입력 피처명을 최대한 추론.
+    - feature_names_in_가 있으면 사용
+    - 파이프라인인 경우, ColumnTransformer의 feature_names_in_ 시도
+    - 실패 시 fallback_cols 반환
+    """
+    # 1) 모델 자체에 feature_names_in_
+    if hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+
+    # 2) 파이프라인 내부 탐색
+    try:
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+        if isinstance(model, Pipeline):
+            # 전처리기 또는 중간 스텝에서 feature_names_in_ 찾기
+            for name, step in model.steps:
+                if hasattr(step, "feature_names_in_"):
+                    return list(step.feature_names_in_)
+                if isinstance(step, ColumnTransformer) and hasattr(step, "feature_names_in_"):
+                    return list(step.feature_names_in_)
+    except Exception:
+        pass
+
+    # 3) 실패 시 폴백
+    return list(fallback_cols)
+
+# -------------------------------
+# 예측/SHAP/레포트
+# -------------------------------
+def run_xgb_predict(model, feature_df: pd.DataFrame):
+    """
+    RandomForest 또는 파이프라인 가정.
+    파이프라인이면 내부에서 transform 후 predict_proba 수행됨.
+    """
+    proba = model.predict_proba(feature_df.values)
+    # 클래스 인덱스 확인 (보통 array([0,1]))
+    pos_idx = 1
+    if hasattr(model, "classes_"):
+        classes = list(model.classes_)
+        if 1 in classes:
+            pos_idx = classes.index(1)
+    p = float(proba[0, pos_idx])
+    y = "위험" if p > 0.5 else "안전"
+    return {"probability": p, "class_label": y}
+
+def compute_shap(model, df_model: pd.DataFrame):
+    """
+    SHAP 계산:
+    - 파이프라인이면 전처리(transform) 후 최종 분류기에 TreeExplainer 적용
+    - 그 외엔 모델에 TreeExplainer 시도
+    - 실패 시 KernelExplainer로 폴백 (단일 샘플 OK)
+    """
+    X = df_model.values
+
+    # 파이프라인 핸들링
+    try:
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+
+        if isinstance(model, Pipeline):
+            # 전처리와 분류기 추출
+            preprocess = None
+            clf = None
+            # 일반적으로 마지막 스텝이 분류기
+            if hasattr(model, "steps") and len(model.steps) >= 1:
+                preprocess = None
+                if len(model.steps) >= 2:
+                    # 마지막 이전까지를 전처리 파이프라인으로 보고 transform 적용
+                    preprocess = model[:-1]
+                clf = model.steps[-1][1]
+
+            if preprocess is not None and hasattr(preprocess, "transform") and hasattr(clf, "predict_proba"):
+                X_trans = preprocess.transform(df_model)
+                explainer = shap.TreeExplainer(clf)
+                shap_values = explainer.shap_values(X_trans)
+            else:
+                # 전처리를 분리할 수 없으면 파이프라인 전체에 대해 바로 시도
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X)
+        else:
+            # 파이프라인이 아니면 바로 TreeExplainer
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X)
+    except Exception:
+        # 폴백: KernelExplainer (시간은 더 들지만 단일 샘플은 가능)
+        try:
+            background = X if len(X) > 10 else np.vstack([X]*10)
+            explainer = shap.KernelExplainer(model.predict_proba, background)
+            shap_values = explainer.shap_values(X, nsamples=50)
+        except Exception:
+            return {"shap_values": np.zeros_like(X), "feature_importance": {}, "top_risk_factors": []}
+
+    # 이진 분류: class1(위험) 기준으로 선택
+    if isinstance(shap_values, list) and len(shap_values) == 2:
+        shap_arr = shap_values[1]
+    else:
+        shap_arr = shap_values
+
+    sample_vals = shap_arr[0]
+    names = df_model.columns.tolist()
+    imp_dict = {names[i]: float(sample_vals[i]) for i in range(len(names))}
+    top5 = sorted([(k, abs(v)) for k, v in imp_dict.items()], key=lambda x: x[1], reverse=True)[:5]
+    return {"shap_values": shap_arr, "feature_importance": imp_dict, "top_risk_factors": top5}
+
 def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
-    """
-    레포트용: SHAP에서 영향이 큰 상위/하위 요인 리스트를 각각 추립니다.
-    상위: |값| 큰 순, sign>0이면 위험↑, sign<0이면 위험↓
-    """
     fi = shap_exp.get("feature_importance", {}) or {}
     if not fi:
         return [], []
@@ -243,111 +340,47 @@ def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
               for (n, a, s) in triples[-top_k:]]
     return top, bottom
 
-# -------------------------------
-# 예측/SHAP/레포트
-# -------------------------------
-def run_xgb_predict(model, feature_df: pd.DataFrame):
-    proba = model.predict_proba(feature_df.values)
-    p = float(proba[0,1])
-    y = "위험" if p > 0.5 else "안전"   # ← 0/1 → “안전/위험”으로 변경
-    return {"probability": p, "class_label": y}
-
-def compute_shap(model, feature_df: pd.DataFrame):
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(feature_df.values)
-    if isinstance(shap_values, list):
-        shap_values = shap_values[0]
-    sample_vals = shap_values[0]
-    names = feature_df.columns.tolist()
-    imp_dict = {names[i]: float(sample_vals[i]) for i in range(len(names))}
-    top5 = sorted([(k, abs(v)) for k, v in imp_dict.items()], key=lambda x: x[1], reverse=True)[:5]
-    return {"shap_values": shap_values, "feature_importance": imp_dict, "top_risk_factors": top5}
-
 def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, shap_exp: dict, ontology_json: dict) -> str:
     """
     보호자 설명 레포트를 SHAP + 온톨로지 양쪽 근거로 풍부하게 생성.
-    - 예측 클래스(안전/위험)에 따라 톤을 자동 조절
     - 온톨로지에서 1인 항목은 반드시 본문에 반영
-    - SHAP 상위 요인은 '왜 그런 예측이 나왔는지'를 설명하는 근거로 사용
+    - SHAP 상위 요인은 '왜 이런 예측이 나왔는지' 근거로 사용
     """
-    # 온톨로지 요약(1/0 분리)
     ont_pos, ont_neg = summarize_ontology_for_report(ontology_json)
-    # SHAP 상·하위 요약
     shap_top, _ = summarize_shap_for_report(shap_exp, top_k=5)
 
-    # 프롬프트에 넣을 JSON/목록(LLM이 정확히 참고하도록)
     ont_pos_for_llm = [{"name": x["name"], "rule": x["rule"]} for x in ont_pos] or [{"name": "해당 항목 없음", "rule": ""}]
     ont_neg_for_llm = [{"name": x["name"], "rule": x["rule"]} for x in ont_neg]
     shap_top_for_llm = shap_top or [{"feature": "해당 없음", "abs_importance": 0.0, "direction": ""}]
-
-    # 클래스에 따른 톤 가이드
     cls_label = prediction.get("class_label", "안전")
 
-    prompt = f"""
-당신은 의료진과 환자 보호자 사이의 소통을 돕는 의료 커뮤니케이션 전문가입니다.
-아래 '모델 예측', '온톨로지 판단 결과', 'SHAP 중요 요인'을 모두 참고하여,
-보호자가 이해하기 쉬운 설명 레포트를 작성하세요.
+    prompt = (
+        "당신은 의료진과 환자 보호자 사이의 소통을 돕는 의료 커뮤니케이션 전문가입니다.\n"
+        "아래 '모델 예측', '온톨로지 판단 결과', 'SHAP 중요 요인'을 모두 참고하여, "
+        "보호자가 이해하기 쉬운 설명 레포트를 작성하세요.\n\n"
+        f"[모델 예측]\n- 발관 실패 확률: {prediction['probability']:.1%}\n- 예측 클래스(안전/위험): {cls_label}\n\n"
+        f"[온톨로지 판단 결과]\n- 이 환자에게 실제 해당된 항목(값=1): {json.dumps(ont_pos_for_llm, ensure_ascii=False)}\n"
+        f"- 해당되지 않은 항목(값=0): {json.dumps(ont_neg_for_llm, ensure_ascii=False)}\n\n"
+        f"[SHAP 중요 요인 Top 5]\n- {json.dumps(shap_top_for_llm, ensure_ascii=False)}\n\n"
+        f"[입력 데이터(요약)]\n- 일부 주요 수치: "
+        f"{json.dumps({k: patient_input[k] for k in ['AGE','BMI','SPO2','MAP','HR','RR','GCS','PH','PACO2','PAO2','HCO3','LACTATE','FIO2','PEEP','PPLAT','TV'] if k in patient_input}, ensure_ascii=False)}\n\n"
+        "[작성 지침]\n"
+        "- 온톨로지에서 값=1인 항목은 '이 환자에게 실제로 관찰된 위험 신호'로 반드시 본문에 포함하세요.\n"
+        "- SHAP 상위 요인은 '왜 이런 예측이 나왔는지' 설명하는 근거로 사용하세요. (증가/감소 방향을 자연스럽게 서술)\n"
+        "- 값=0인 온톨로지 항목은 필요 시 '완화 요인' 또는 '현재는 해당 없음'으로 간단히 언급해도 됩니다.\n"
+        "- 확률 수치는 비유/사례로 쉽게 설명하되, 절대적인 진단이 아님을 분명히 하세요.\n"
+        "- 전문용어는 쉬운 말로 풀어서 설명하세요.\n"
+        "- 마크다운 금지, 섹션 제목은 [섹션명] 형태.\n"
+        "- 분량: 8~14문장 정도.\n\n"
+        "[권장 구성]\n"
+        "1) [인사 및 목적] 2~3문장\n"
+        "2) [현재 상태 요약] 2~3문장 (중요 수치 간단 해석)\n"
+        "3) [예측 결과 해석] 2~3문장 (확률 의미, 안전/위험 맥락)\n"
+        "4) [해당된 위험 신호(온톨로지)] 2~4문장 (값=1 항목을 풀어서 설명)\n"
+        "5) [예측 근거(모델 관점)] 2~3문장 (SHAP Top 요인을 쉬운 언어로)\n"
+        "6) [권고 및 마무리] 1~2문장 (모니터링/소통 강조)\n"
+    )
 
-[모델 예측]
-- 발관 실패 확률: {prediction['probability']:.1%}
-- 예측 클래스(안전/위험): {cls_label}
-
-[온톨로지 판단 결과]
-- 이 환자에게 실제 해당된 항목(값=1): {json.dumps(ont_pos_for_llm, ensure_ascii=False)}
-- 해당되지 않은 항목(값=0): {json.dumps(ont_neg_for_llm, ensure_ascii=False)}
-
-[SHAP 중요 요인 Top 5]
-- {json.dumps(shap_top_for_llm, ensure_ascii=False)}
-
-[입력 데이터(요약)]
-- 일부 주요 수치: {json.dumps({k: patient_input[k] for k in ['AGE','BMI','SPO2','MAP','HR','RR','GCS','PH','PACO2','PAO2','HCO3','LACTATE','FIO2','PEEP','PPLAT','TV'] if k in patient_input}, ensure_ascii=False)}
-
-[작성 지침]
-- 톤: 
-## 레포트 작성 지침
-**목적**: 보호자가 발관(인공호흡기 튜브 제거) 결정을 내리는 데 도움이 되는 정보를 제공합니다.
-**톤 & 스타일**:
-- 따뜻하고 공감적인 어조를 유지하세요
-- 보호자의 불안감을 이해하면서도 정확한 정보를 전달하세요
-- 의학적 전문성과 인간미를 균형있게 표현하세요
-**용어 선택**:
-- 전문 의료 용어는 일반인이 이해하기 쉬운 표현으로 바꿔주세요
-  예: "발관/삽관" → "호흡관 제거", "인공호흡기 튜브 제거"
-  예: "SPO2" → "혈중 산소포화도" 또는 "산소 수치"
-  예: "BMI" → "체질량지수" 또는 "비만도"
-- Feature 이름(영어 또는 전문용어)은 한글로 의역하여 설명하세요
-**설명 방식**:
-- 확률 수치를 구체적인 예시나 비유로 쉽게 설명하세요
-- 위험 요인이 왜 중요한지 보호자 입장에서 설명하세요
-- 의료진의 모니터링과 전문적 판단이 중요함을 강조하세요
-## 레포트 구성 (다음 순서로 작성)
-1. **인사 및 소개** (2-3문장)
-   - 따뜻한 인사와 레포트의 목적 설명
-2. **환자 상태 요약** (3-4문장)
-   - 제공된 환자 정보를 일반인이 이해할 수 있는 방식으로 요약
-   - 각 수치가 정상 범위인지, 주의가 필요한지 간단히 설명
-3. **AI 예측 결과 해석** (4-5문장)
-   - 실패 확률이 의미하는 바를 쉽게 설명
-   - 이 확률이 높은지 낮은지 맥락 제공
-   - 예측이 절대적이 아닌 참고자료임을 명시
-4. **주요 위험 요인 상세 설명** (각 요인당 2-3문장)
-   - SHAP top 요인 3-5개 위험 요인을 선택하여 설명
-   - 각 요인이 왜 발관 성공/실패에 영향을 미치는지 설명
-   - Feature 이름을 보호자가 이해할 수 있는 용어로 변환
-5. **마무리 메시지** (2문장)
-   - 안심과 격려의 메시지
-   - 의료진의 전문성에 대한 신뢰 강조
-**중요**: 레포트는 순수한 한글 텍스트로만 작성하고, 마크다운 서식(#, **, - 등)은 사용하지 마세요.
-섹션 제목은 [섹션명] 형태로 표시하세요.
-
-- 온톨로지에서 값=1인 항목은 '이 환자에게 실제로 관찰된 위험 신호'로 반드시 본문에 포함하세요.
-- SHAP 상위 요인은 '왜 이런 예측이 나왔는지' 설명하는 근거로 사용하세요. (증가/감소 방향을 자연스럽게 서술)
-- 값=0인 온톨로지 항목은 필요 시 '완화 요인' 또는 '현재는 해당 없음'으로 간단히 언급해도 됩니다.
-- 확률 수치는 비유/사례로 쉽게 설명하되, 절대적인 진단이 아님을 분명히 하세요.
-- 전문용어는 쉬운 말로 풀어서 설명하세요.
-- 마크다운 금지, 섹션 제목은 [섹션명] 형태.
-- 분량: 8~14문장 정도.
-"""
     resp = client.chat.completions.create(
         model=FIXED_GENERATION_MODEL,
         messages=[
@@ -453,36 +486,39 @@ if run:
     patient_input = {k: float(st.session_state[f"val_{k}"]) if not np.isnan(st.session_state[f"val_{k}"]) else np.nan
                      for k in REQUIRED_FEATURES}
 
-    # 1) 입력 → DF
-    df = _df_from_patient_input(patient_input)
+    # 1) 입력 → DF (베이스라인)
+    df_base = _df_from_patient_input(patient_input)
 
-    # 2) 온톨로지 태깅
+    # 2) 온톨로지 태깅 (UI/레포트용)
     with st.spinner("🤖 LLM agent가 예측도 향상을 위한 온톨로지 태깅 중..."):
         try:
             if USE_LLM and OPENAI_API_KEY:
                 client = build_openai_client()
-                ontology_json = llm_tag_ontology(client, df)
+                ontology_json = llm_tag_ontology(client, df_base)
             else:
-                ontology_json = rule_based_ontology(df)
+                ontology_json = rule_based_ontology(df_base)
         except Exception as e:
             st.warning(f"LLM 태깅 실패. 룰 기반으로 대체합니다. ({e})")
-            ontology_json = rule_based_ontology(df)
+            ontology_json = rule_based_ontology(df_base)
 
-    feature_df = attach_ontology_features(df.copy(), ontology_json)
+    # ✅ UI용(표시/레포트): 온톨로지 추가
+    df_ui = attach_ontology_features(df_base.copy(), ontology_json)
 
-    # 3) 모델 로드 & 예측
+    # 3) 모델 로드 & 예측 (❗ 모델 입력에는 온톨로지 미포함)
     with st.spinner("랜덤포레스트로 예측 중..."):
         try:
-            booster = load_xgb_model(FIXED_MODEL_PATH)
-            pred = run_xgb_predict(booster, feature_df)
+            model = load_xgb_model(FIXED_MODEL_PATH)
+            expected_cols = get_expected_model_features(model, fallback_cols=REQUIRED_FEATURES)
+            df_model = df_base.reindex(columns=expected_cols)
+            pred = run_xgb_predict(model, df_model)
         except Exception as e:
             st.error(f"예측 오류: {e}")
             st.stop()
 
-    # 4) SHAP
+    # 4) SHAP (✅ 모델 입력 df_model 기준)
     with st.spinner("SHAP 계산 중..."):
         try:
-            shap_exp = compute_shap(booster, feature_df)
+            shap_exp = compute_shap(model, df_model)
         except Exception as e:
             st.warning(f"SHAP 계산 실패: {e}")
             shap_exp = {"feature_importance": {}, "top_risk_factors": []}
@@ -493,7 +529,6 @@ if run:
         with st.spinner("🫶 보호자분을 위한 설명 레포트 생성 중..."):
             try:
                 client = build_openai_client()
-                # ⬇️ 온톨로지 함께 전달
                 report_text = llm_generate_report(client, patient_input, pred, shap_exp, ontology_json)
             except Exception as e:
                 st.warning(f"레포트 생성 실패: {e}")
@@ -526,21 +561,15 @@ if run:
 
     # (5) 보호자 설명용 레포트: 편집 가능한 텍스트 박스
     st.markdown("### 보호자 설명용 레포트")
-
     if report_text:
-        # 최초 생성 시 세션 상태에 저장
         if "report_text" not in st.session_state or not st.session_state.get("report_text"):
             st.session_state.report_text = report_text
-
-        # 편집 가능한 텍스트 영역
         st.session_state.report_text = st.text_area(
             "생성된 레포트 (편집 가능)",
             value=st.session_state.report_text,
             height=420,
             help="필요 시 문구를 수정하여 보호자 커뮤니케이션에 활용하세요."
         )
-
-        # 다운로드 버튼 (선택)
         st.download_button(
             label="레포트 .txt 다운로드",
             data=st.session_state.report_text,
@@ -552,7 +581,7 @@ if run:
         st.info("레포트가 생성되지 않았습니다. 상단에서 예측을 실행하면 자동으로 생성됩니다.")
 
     st.markdown("### 모델 입력 전체 Feature (추론 시 사용)")
-    st.dataframe(feature_df, use_container_width=True)
+    st.dataframe(df_model, use_container_width=True)
 
     # 채팅 메모리에 저장할 컨텍스트 업데이트
     st.session_state.memory = {
@@ -571,7 +600,6 @@ with st.sidebar:
     if OPENAI_API_KEY is None:
         st.caption("OpenAI 키가 없어서 채팅은 비활성화됩니다. (Secrets에 OPENAI_API_KEY 추가)")
     else:
-        # 최근 예측 컨텍스트를 시스템 메시지로 주입
         context_blob = json.dumps(st.session_state.memory, ensure_ascii=False, indent=2) if st.session_state.memory else "최근 예측 컨텍스트 없음."
         system_msg = (
             "당신은 중환자실에 입실한 환자 보호자를 대하는 의료인입니다. "
@@ -579,7 +607,6 @@ with st.sidebar:
             f"[최근 예측 컨텍스트]\n{context_blob}"
         )
 
-        # 기존 대화 표시
         for m in st.session_state.chat_history:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
@@ -592,7 +619,7 @@ with st.sidebar:
 
             try:
                 client = build_openai_client()
-                messages = [{"role":"system","content":system_msg}] + st.session_state.chat_history[-20:]  # 최근 20턴
+                messages = [{"role":"system","content":system_msg}] + st.session_state.chat_history[-20:]
                 resp = client.chat.completions.create(
                     model=CHAT_MODEL,
                     messages=messages,
