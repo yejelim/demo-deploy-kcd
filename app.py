@@ -114,7 +114,7 @@ def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
     for k in labels:
         val = int(row.get(k, 0))
         icon = "✅" if val == 1 else "❌"
-        rows.append({"특성": labels[k], "설명": desc[k], "여부": icon})
+        rows.append({"특성": labels[k], "여부": icon})
     return pd.DataFrame(rows)
 
 # -------------------------------
