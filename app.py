@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-import xgboost as xgb
+import joblib
 import shap
 from openai import OpenAI
 
@@ -22,7 +22,7 @@ USE_LLM = True   # secrets에 키가 없으면 자동 Fallback
 FIXED_TAGGING_MODEL = "gpt-4o-mini"        # 사내 게이트웨이 쓰면 거기서 지원하는 이름으로 교체
 FIXED_GENERATION_MODEL = "gpt-4o-mini"
 CHAT_MODEL = "gpt-4o-mini"                 # 사이드바 채팅용
-FIXED_MODEL_PATH = "./models/xgboost_model.json"
+FIXED_MODEL_PATH = "./models/best_model.pkl"
 
 # -------------------------------
 # 유틸 / 상수
@@ -53,9 +53,8 @@ def load_xgb_model(model_path: str = FIXED_MODEL_PATH):
     p = Path(model_path)
     if not p.exists():
         raise FileNotFoundError(f"Model not found at {model_path}.")
-    booster = xgb.Booster()
-    booster.load_model(str(p))
-    return booster
+    model = joblib.load(str(p))
+    return model
 
 def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
     df = pd.DataFrame([patient_input])
@@ -67,18 +66,28 @@ def _df_from_patient_input(patient_input: dict) -> pd.DataFrame:
 # -------------------------------
 def _ontology_label_maps():
     labels = {
+        "diabetes_mellitus": "당뇨병",
+        "obesity": "비만",
+        "prolonged_mechanical_ventilation_history": "장기간 기계환기 병력",
+        "advanced_age": "고령",
+        "low_PaO2_FiO2_ratio": "낮은 PaO2/FiO2 비율",
+        "congestive_heart_failure": "울혈성 심부전",
+        "anemia": "빈혈",
         "hemodynamic_instability": "혈역학적 불안정",
-        "respiratory_distress": "호흡 곤란",
-        "obesity_risk": "비만 위험",
-        "age_risk": "고령 위험",
-        "airway_obstruction_risk": "기도 폐쇄 위험"
+        "low_mean_arterial_pressure": "낮은 평균 동맥압",
+        "leukocytosis": "백혈구 증가증",
     }
     desc = {
-        "hemodynamic_instability": "SpO₂<90% 또는 심박 이상",
-        "respiratory_distress": "SpO₂<85%",
-        "obesity_risk": "BMI≥30",
-        "age_risk": "나이≥65세",
-        "airway_obstruction_risk": "비만+호흡곤란 동시"
+        "diabetes_mellitus": "SpO₂<90% 또는 심박 이상",
+        "obesity": "SpO₂<85%",
+        "prolonged_mechanical_ventilation_history": "장기간 기계환기 병력",
+        "advanced_age": "고령",
+        "low_PaO2_FiO2_ratio": "낮은 PaO2/FiO2 비율",
+        "congestive_heart_failure": "울혈성 심부전",
+        "anemia": "빈혈",
+        "hemodynamic_instability": "혈압 또는 심박 이상",
+        "low_mean_arterial_pressure": "낮은 평균 동맥압",
+        "leukocytosis": "백혈구 증가증"
     }
     return labels, desc
 
@@ -113,12 +122,41 @@ def ontology_pretty_table(ontology_json: dict) -> pd.DataFrame:
 # -------------------------------
 def rule_based_ontology(df: pd.DataFrame) -> dict:
     row = df.iloc[0]
-    hemo = int((row.get("SPO2", 100) < 90) or (row.get("HR", 80) < 40) or (row.get("HR", 80) > 120))
-    resp = int(row.get("SPO2", 100) < 85)
-    ob   = int(row.get("BMI", 0) >= 30)
-    age  = int(row.get("AGE", 0) >= 65)
-    airway = int(ob and resp)
-    return {"patients":[{"patient_index":0,"hemodynamic_instability":hemo,"respiratory_distress":resp,"obesity_risk":ob,"age_risk":age,"airway_obstruction_risk":airway}]}
+    # Updated ontology mapping (align with keys defined at the top helpers)
+    dm = int(row.get("DM", 0) == 1)  # explicit diabetes flag
+    obesity = int(row.get("BMI", 0) >= 30)
+    prolonged_mv = int(row.get("VENT_DUR", 0) >= 48)  # hours threshold for prolonged ventilation
+    advanced_age = int(row.get("AGE", 0) >= 65)
+    # PaO2/FiO2 ratio (FiO2 given as %, ensure minimum 21%)
+    pao2 = float(row.get("PAO2", 0))
+    fio2_pct = float(row.get("FIO2", 21.0))
+    fio2_frac = max(fio2_pct, 21.0) / 100.0
+    pf_ratio = pao2 / fio2_frac if fio2_frac > 0 else 0.0
+    low_pfr = int(pf_ratio < 200)  # conservative threshold
+    # New signals
+    chf = int(row.get("CHF", 0) == 1)
+    anemia = int(float(row.get("HB", 0)) < 10.0)
+    hemo_instab = int((float(row.get("HR", 80)) < 40) or (float(row.get("HR", 80)) > 120) or (float(row.get("MAP", 80)) < 60))
+    low_map = int(float(row.get("MAP", 80)) < 65)
+    leukocytosis = int(float(row.get("WBC", 0)) > 12.0)
+
+    return {
+        "patients": [
+            {
+                "patient_index": 0,
+                "diabetes_mellitus": dm,
+                "obesity": obesity,
+                "prolonged_mechanical_ventilation_history": prolonged_mv,
+                "advanced_age": advanced_age,
+                "low_PaO2_FiO2_ratio": low_pfr,
+                "congestive_heart_failure": chf,
+                "anemia": anemia,
+                "hemodynamic_instability": hemo_instab,
+                "low_mean_arterial_pressure": low_map,
+                "leukocytosis": leukocytosis,
+            }
+        ]
+    }
 
 def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
     patient_records = df.to_dict(orient='records')
@@ -129,16 +167,33 @@ def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
 {json.dumps(patient_records, ensure_ascii=False, indent=2)}
 
 다음 특성을 0 또는 1로 반환:
-1. hemodynamic_instability
-2. respiratory_distress
-3. obesity_risk
-4. age_risk
-5. airway_obstruction_risk
+1. diabetes_mellitus
+2. obesity
+3. prolonged_mechanical_ventilation_history
+4. advanced_age
+5. low_PaO2_FiO2_ratio
+6. congestive_heart_failure
+7. anemia
+8. hemodynamic_instability
+9. low_mean_arterial_pressure
+10. leukocytosis
 
 반드시 아래 JSON 스키마만 반환:
-{{
-  "patients": [{{"patient_index":0,"hemodynamic_instability":0,"respiratory_distress":0,"obesity_risk":0,"age_risk":0,"airway_obstruction_risk":0}}]
-}}
+{
+    "patients": [{
+        "patient_index":0,
+        "diabetes_mellitus":0,
+        "obesity":0,
+        "prolonged_mechanical_ventilation_history":0,
+        "advanced_age":0,
+        "low_PaO2_FiO2_ratio":0,
+        "congestive_heart_failure":0,
+        "anemia":0,
+        "hemodynamic_instability":0,
+        "low_mean_arterial_pressure":0,
+        "leukocytosis":0
+    }]
+}
 """
     resp = client.chat.completions.create(
         model=FIXED_TAGGING_MODEL,
@@ -152,7 +207,18 @@ def llm_tag_ontology(client: OpenAI, df: pd.DataFrame) -> dict:
     return json.loads(resp.choices[0].message.content)
 
 def attach_ontology_features(df: pd.DataFrame, ontology_json: dict):
-    feature_names = ["hemodynamic_instability","respiratory_distress","obesity_risk","age_risk","airway_obstruction_risk"]
+    feature_names = [
+        "diabetes_mellitus",
+        "obesity",
+        "prolonged_mechanical_ventilation_history",
+        "advanced_age",
+        "low_PaO2_FiO2_ratio",
+        "congestive_heart_failure",
+        "anemia",
+        "hemodynamic_instability",
+        "low_mean_arterial_pressure",
+        "leukocytosis",
+    ]
     for k in feature_names:
         v = ontology_json["patients"][0].get(k, 0)
         df[k] = int(v)
@@ -180,17 +246,15 @@ def summarize_shap_for_report(shap_exp: dict, top_k: int = 5):
 # -------------------------------
 # 예측/SHAP/레포트
 # -------------------------------
-def run_xgb_predict(booster: xgb.Booster, feature_df: pd.DataFrame):
-    dmatrix = xgb.DMatrix(feature_df.values)
-    preds = booster.predict(dmatrix)
-    p = float(preds[0])
+def run_xgb_predict(model, feature_df: pd.DataFrame):
+    proba = model.predict_proba(feature_df.values)
+    p = float(proba[0,1])
     y = "위험" if p > 0.5 else "안전"   # ← 0/1 → “안전/위험”으로 변경
     return {"probability": p, "class_label": y}
 
-def compute_shap(booster: xgb.Booster, feature_df: pd.DataFrame):
-    dmatrix = xgb.DMatrix(feature_df.values)
-    explainer = shap.TreeExplainer(booster)
-    shap_values = explainer.shap_values(dmatrix)
+def compute_shap(model, feature_df: pd.DataFrame):
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(feature_df.values)
     if isinstance(shap_values, list):
         shap_values = shap_values[0]
     sample_vals = shap_values[0]
@@ -407,7 +471,7 @@ if run:
     feature_df = attach_ontology_features(df.copy(), ontology_json)
 
     # 3) 모델 로드 & 예측
-    with st.spinner("XGBoost 예측 중..."):
+    with st.spinner("랜덤포레스트로 예측 중..."):
         try:
             booster = load_xgb_model(FIXED_MODEL_PATH)
             pred = run_xgb_predict(booster, feature_df)

@@ -2,5 +2,5 @@ streamlit>=1.38
 openai>=1.45
 pandas>=2.2
 numpy>=1.26
-xgboost>=2.0
+scikit-learn>=1.4
 shap>=0.46
