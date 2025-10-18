@@ -328,7 +328,7 @@ def llm_generate_report(client: OpenAI, patient_input: dict, prediction: dict, s
     prompt = (
         "당신은 의료진과 환자 보호자 사이의 소통을 돕는 의료 커뮤니케이션 전문가입니다.\n"
         "아래 '모델 예측', '온톨로지 판단 결과', 'SHAP 중요 요인'을 모두 참고하여, "
-        "보호자가 이해하기 쉬운 설명 레포트를 작성하세요.\n\n"
+        "보호자가 이해하기 쉬운 설명 레포트를 영어로 작성하세요.\n\n"
         f"[모델 예측]\n- 발관 실패 확률: {prediction['probability']:.1%}\n- 예측 클래스(안전/위험): {cls_label}\n\n"
         f"[온톨로지 판단 결과]\n- 이 환자에게 실제 해당된 항목(값=1): {json.dumps(ont_pos_for_llm, ensure_ascii=False)}\n"
         f"- 해당되지 않은 항목(값=0): {json.dumps(ont_neg_for_llm, ensure_ascii=False)}\n\n"
@@ -380,8 +380,8 @@ if "memory" not in st.session_state:
 # -------------------------------
 st.title("🖥️ KCD 2025 J. - Will the first extubation be successful?")
 
-st.subheader("➡️ 예시 케이스 선택")
-selected_case = st.selectbox("예시 케이스", list(EXAMPLE_CASES.keys()), index=0)
+st.subheader("➡️ Select Example Case")
+selected_case = st.selectbox("Example Case", list(EXAMPLE_CASES.keys()), index=0)
 case_vals = EXAMPLE_CASES[selected_case]
 
 # 초기값 주입
@@ -393,11 +393,11 @@ def apply_case(vals: dict):
     for k, v in vals.items():
         st.session_state[f"val_{k}"] = v
 
-if st.button("이 케이스 값 불러오기"):
+if st.button("Loading the values from the selected case..."):
     apply_case(EXAMPLE_CASES[selected_case])
-    st.success(f"{selected_case} 값이 입력 폼에 반영되었습니다.")
+    st.success(f"{selected_case} values have been loaded into the input form.")
 
-st.subheader("🗒️ 환자 입력")
+st.subheader("🗒️ Patient Variables input")
 colA, colB, colC, colD, colE = st.columns(5)
 
 with colA:
@@ -446,8 +446,8 @@ with colE:
     st.session_state["val_PPLAT"] = st.number_input("Pplat", 0.0, 60.0, float(st.session_state["val_PPLAT"]))
     st.session_state["val_TV"] = st.number_input("TV (mL)", 0.0, 1500.0, float(st.session_state["val_TV"]))
 
-st.subheader("➡️ 실행")
-run = st.button("예측 결과 및 레포트 확인하기")
+st.subheader("➡️ Generate Prediction & Report")
+run = st.button("Check Prediction Results & Report")
 
 if run:
     # 1) 입력 DF(베이스라인)
@@ -456,7 +456,7 @@ if run:
     df_base = _df_from_patient_input(patient_input)
 
     # 2) 온톨로지 태깅 → 모델/UI 둘 다 사용
-    with st.spinner("🤖 LLM agent가 온톨로지 태깅 중..."):
+    with st.spinner("🤖 LLM agent is tagging Ontologies..."):
         try:
             if USE_LLM and OPENAI_API_KEY:
                 client = build_openai_client()
@@ -471,7 +471,7 @@ if run:
     df_with_onto = attach_ontology_features(df_base.copy(), ontology_json)
 
     # 3) 모델 로드 & 예측 (온톨로지 포함 입력)
-    with st.spinner("랜덤포레스트(온톨로지 포함)로 예측 중..."):
+    with st.spinner("🤖 Predicting with Random Forest..."):
         try:
             model = load_model(FIXED_MODEL_PATH)
             expected_cols = get_expected_model_features(model, fallback_cols=ALL_FEATURES_FALLBACK)
@@ -482,7 +482,7 @@ if run:
             st.stop()
 
     # 4) SHAP (온톨로지 포함 입력 기준)
-    with st.spinner("SHAP 계산 중..."):
+    with st.spinner("SHAP calculation in progress..."):
         try:
             shap_exp = compute_shap(model, df_model)
         except Exception as e:
@@ -492,29 +492,29 @@ if run:
     # 5) 레포트
     report_text = None
     if USE_LLM and OPENAI_API_KEY:
-        with st.spinner("🫶 보호자분을 위한 설명 레포트 생성 중..."):
+        with st.spinner("🫶 Generating explanation report for guardians..."):
             try:
                 client = build_openai_client()
                 report_text = llm_generate_report(client, patient_input, pred, shap_exp, ontology_json)
             except Exception as e:
-                st.warning(f"레포트 생성 실패: {e}")
+                st.warning(f"Report generation failed: {e}")
                 report_text = None
 
     # 결과 표시
-    st.success("완료!")
+    st.success("Complete!")
 
     col1, col2 = st.columns([1,1])
     with col1:
-        st.markdown("### 예측 결과")
-        st.metric("발관 실패 확률", f"{pred['probability']*100:.1f}%")
-        st.metric("예측 클래스", pred["class_label"])
+        st.markdown("### Prediction Results")
+        st.metric("Extubation Failure Probability", f"{pred['probability']*100:.1f}%")
+        st.metric("Predicted Class", pred["class_label"])
 
-        st.markdown("### 온톨로지 태깅 결과")
+        st.markdown("### Ontology Tagging Results")
         pretty_df = ontology_pretty_table(ontology_json)
         st.dataframe(pretty_df, hide_index=True, use_container_width=True)
 
     with col2:
-        st.markdown("### 상위 위험 요인 (SHAP | 절대값 Top 5)")
+        st.markdown("### Top Risk Factors (SHAP | Absolute Top 5)")
         if "top_risk_factors" in shap_exp and shap_exp["top_risk_factors"]:
             rows = []
             for name, abs_imp in shap_exp["top_risk_factors"]:
@@ -526,28 +526,28 @@ if run:
             st.write("계산되지 않았습니다.")
 
     # 보호자 설명용 레포트 (편집/다운로드)
-    st.markdown("### 보호자 설명용 레포트")
+    st.markdown("### Explanation Report for Guardians")
     if report_text:
         if "report_text" not in st.session_state or not st.session_state.get("report_text"):
             st.session_state.report_text = report_text
         st.session_state.report_text = st.text_area(
-            "생성된 레포트 (편집 가능)",
+            "Generated Report (Editable)",
             value=st.session_state.report_text,
             height=420,
             help="필요 시 문구를 수정하여 보호자 커뮤니케이션에 활용하세요."
         )
         st.download_button(
-            label="레포트 .txt 다운로드",
+            label="Download Report .txt",
             data=st.session_state.report_text,
             file_name=f"extubation_report_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
             mime="text/plain",
             use_container_width=True
         )
     else:
-        st.info("레포트가 생성되지 않았습니다. 상단에서 예측을 실행하면 자동으로 생성됩니다.")
+        st.info("Report has not been generated. Please run the prediction above to generate it.")
 
     # ▶ 모델 입력 전체 Feature (온톨로지 포함)
-    st.markdown("### 모델 입력 전체 Feature (온톨로지 포함, 추론 시 사용)")
+    st.markdown("### Every Features")
     # 보기 좋게: 모델 입력 피처 + 온톨로지 라벨/설명 합쳐서 보여주기
     labels, desc = _ontology_label_maps()
     onto_row = ontology_json["patients"][0]
@@ -582,14 +582,14 @@ with st.sidebar:
     if image_path.exists():
         st.image(str(image_path), use_container_width=True)
 
-    st.header("💬 환자 보호자를 위한 챗봇 어시스턴트")
+    st.header("💬 Chatbot Assistant for Patient Guardians")
     if OPENAI_API_KEY is None:
         st.caption("OpenAI 키가 없어서 채팅은 비활성화됩니다. (Secrets에 OPENAI_API_KEY 추가)")
     else:
         context_blob = json.dumps(st.session_state.memory, ensure_ascii=False, indent=2) if st.session_state.memory else "최근 예측 컨텍스트 없음."
         system_msg = (
             "당신은 중환자실에 입실한 환자 보호자를 대하는 의료인입니다. "
-            "아래 '최근 예측 컨텍스트'를 참고하여 친절하고 쉽게 답변하세요. 의료인이 아닌 사람들도 알아들을 수 있도록 설명하세요. \n\n"
+            "아래 '최근 예측 컨텍스트'를 참고하여 친절하고 쉽게 답변하세요. 의료인이 아닌 사람들도 알아들을 수 있도록 설명하세요. 영어로 응답하세요. \n\n"
             f"[최근 예측 컨텍스트]\n{context_blob}"
         )
         for m in st.session_state.chat_history:
