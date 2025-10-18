@@ -558,8 +558,7 @@ if run:
         onto_rows.append({
             "Feature": key,
             "태깅결과(0/1)": int(onto_row.get(key, 0)),
-            "온톨로지_특성": labels.get(key, key),
-            "의미(설명)": desc.get(key, "")
+            "온톨로지_특성": labels.get(key, key)
         })
     onto_df = pd.DataFrame(onto_rows).set_index("Feature")
     df_display = pd.concat([df_display, sep, onto_df], axis=0)
